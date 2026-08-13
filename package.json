@@ -1,0 +1,25 @@
+{
+  "name": "gma-store-pos",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/contracts",
+    "packages/domain",
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "build:packages": "npm run build -w @gma/contracts && npm run build -w @gma/domain",
+    "build": "npm run build:packages && npm run build -w @gma/api && npm run build -w @gma/web",
+    "dev": "npm run build:packages && concurrently -n api,web -c blue,green \"npm run dev -w @gma/api\" \"npm run dev -w @gma/web\"",
+    "test": "npm run build:packages && npm run test -w @gma/domain && npm run test -w @gma/api && npm run test -w @gma/web",
+    "typecheck": "npm run build:packages && npm run typecheck -w @gma/api && npm run typecheck -w @gma/web",
+    "db:migrate": "npm run db:migrate -w @gma/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
