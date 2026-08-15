@@ -328,6 +328,9 @@ export const saveProductCommandSchema = z.object({
 export const completeSaleCommandSchema = z.object({
   type: z.literal('completeSale'),
   payload: z.object({
+    saleId: z.string().uuid(),
+    transactionNumber: z.string().trim().min(1).max(64),
+    occurredAt: zIso,
     paymentMethod: z.enum(paymentMethods),
     cashReceived: z.number().int().min(0).nullable(),
     customerId: z.string().uuid().nullable(),

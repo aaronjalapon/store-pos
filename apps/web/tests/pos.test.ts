@@ -37,6 +37,16 @@ describe('offline checkout transaction', () => {
     expect(await db.saleItems.count()).toBe(1);
     expect(await db.inventoryMovements.count()).toBe(1);
     expect((await db.products.get(product.id))?.stockQuantity).toBe(1);
+    const queued = await db.mutationQueue.toArray();
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ status: 'pending', attemptCount: 0 });
+    expect(queued[0].request.command.type).toBe('completeSale');
+    if (queued[0].request.command.type === 'completeSale') {
+      expect(queued[0].request.command.payload).toMatchObject({
+        saleId: result.saleId,
+        transactionNumber: (await db.sales.get(result.saleId))?.transactionNumber,
+      });
+    }
   });
 
   it('rolls back all writes when requested stock is unavailable', async () => {
@@ -45,6 +55,7 @@ describe('offline checkout transaction', () => {
       .rejects.toThrow('Only 3');
     expect(await db.sales.count()).toBe(0);
     expect(await db.saleItems.count()).toBe(0);
+    expect(await db.mutationQueue.count()).toBe(0);
     expect((await db.products.get(product.id))?.stockQuantity).toBe(3);
   });
 

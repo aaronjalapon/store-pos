@@ -8,13 +8,13 @@ import {
   Cloud, CreditCard, Minus, MoreHorizontal, PackageOpen, Plus, ReceiptText, Search,
   ShoppingBasket, Trash2, Upload, UserRoundPlus, WalletCards, Wifi, WifiOff, X,
 } from 'lucide-react';
-import { db } from '../lib/db';
+import { db, removeLocalStoreData } from '../lib/db';
 import { centavosToPesoInput, pesoInputToCentavos } from '../lib/money';
 import {
   adjustStock, completeSale, createCustomer, recordExpense, recordUtangPayment, saveProduct, type CartEntry,
   restockProduct,
 } from '../lib/pos';
-import { flushMutationQueue, getCachedConflictMessage, isManagerAccessDenied, syncStore } from '../lib/api';
+import { getCachedConflictMessage, getSyncState, isManagerAccessDenied, requestSync, retryNeedsAttention, type SyncState } from '../lib/api';
 import { BackupPanel } from './backup-panel';
 import { CameraScanner, type BarcodeSuggestion } from './camera-scanner';
 import { compressProductImage, hydrateProductImage, type CompressedProductImage } from '../lib/product-images';
@@ -68,6 +68,10 @@ export function PosApp({ session, onLogout }: { session: StoreAuthSession; onLog
   const [ready, setReady] = useState(false);
   const [online, setOnline] = useState(true);
   const [syncConflict, setSyncConflict] = useState('');
+  const [syncState, setSyncState] = useState<SyncState>({
+    phase: 'synced', pendingCount: 0, needsAttentionCount: 0, pendingSaleCount: 0,
+    needsAttentionSaleCount: 0, completedCount: 0, totalCount: 0,
+  });
 
   const canManageStore = session.user.role !== 'cashier';
   const availableTabs: Tab[] = canManageStore ? ['sell', 'inventory', 'utang', 'reports', 'more'] : ['sell', 'more'];
@@ -82,33 +86,38 @@ export function PosApp({ session, onLogout }: { session: StoreAuthSession; onLog
 
   useEffect(() => {
     let syncTimer: ReturnType<typeof setTimeout> | undefined;
+    const loadSyncState = () => void getSyncState().then(setSyncState);
     void load();
     setOnline(navigator.onLine);
     void navigator.storage?.persist?.();
     if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
     const changed = () => {
       void load();
+      loadSyncState();
       clearTimeout(syncTimer);
-      syncTimer = setTimeout(() => void flushMutationQueue(), 500);
+      syncTimer = setTimeout(() => void requestSync(), 500);
     };
     const wentOnline = () => {
       setOnline(true);
-      void syncStore().then(() => flushMutationQueue()).then(load);
+      void requestSync().then(load);
     };
-    const wentOffline = () => setOnline(false);
+    const wentOffline = () => { setOnline(false); loadSyncState(); };
     const syncConflictChanged = () => void getCachedConflictMessage().then(setSyncConflict);
     window.addEventListener('pos-data-changed', changed);
     window.addEventListener('online', wentOnline);
     window.addEventListener('offline', wentOffline);
     window.addEventListener('pos-sync-conflict', syncConflictChanged);
+    window.addEventListener('pos-sync-state-changed', loadSyncState);
     void getCachedConflictMessage().then(setSyncConflict);
-    void syncStore().then(load).catch(() => undefined);
+    loadSyncState();
+    void requestSync().then(load).catch(() => undefined);
     return () => {
       clearTimeout(syncTimer);
       window.removeEventListener('pos-data-changed', changed);
       window.removeEventListener('online', wentOnline);
       window.removeEventListener('offline', wentOffline);
       window.removeEventListener('pos-sync-conflict', syncConflictChanged);
+      window.removeEventListener('pos-sync-state-changed', loadSyncState);
     };
   }, [load]);
 
@@ -118,18 +127,27 @@ export function PosApp({ session, onLogout }: { session: StoreAuthSession; onLog
 
   if (!ready) return <div className="app-loading"><div className="brand-mark">G</div><p>Opening store…</p></div>;
 
+  const syncLabel = syncState.phase === 'needs_attention'
+    ? `Needs attention · ${syncState.needsAttentionSaleCount || syncState.needsAttentionCount}`
+    : syncState.phase === 'syncing'
+      ? `Syncing ${syncState.completedCount} of ${syncState.totalCount}`
+      : syncState.pendingCount > 0
+        ? `${online ? 'Pending' : 'Offline'} · ${syncState.pendingSaleCount || syncState.pendingCount} ${syncState.pendingSaleCount ? 'sales' : 'changes'}`
+        : syncState.phase === 'offline' ? 'Offline · locally saved' : 'Synced';
+  const syncHealthy = syncState.phase === 'synced';
+
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="store-wordmark"><div className="brand-mark small">G</div><div><strong>{session.store.name}</strong><span>POINT OF SALE</span></div></div>
         <div className="topbar-actions">
-          <div className={`connection-pill ${online ? 'online' : ''}`}>{online ? <Wifi size={15} /> : <WifiOff size={15} />}{online ? 'Online' : 'Offline cache'}</div>
+          <div className={`connection-pill ${syncHealthy ? 'online' : ''}`}>{syncHealthy ? <Wifi size={15} /> : syncState.phase === 'syncing' ? <Cloud size={15} /> : <WifiOff size={15} />}{syncLabel}</div>
           <div className="session-pill"><strong>{session.user.displayName}</strong><span>{session.user.role.toUpperCase()}</span></div>
           <button className="secondary-button compact" onClick={() => void onLogout()}><LogOut size={16} /> Logout</button>
         </div>
       </header>
       <div className="content-area">
-        {syncConflict && <div className="sync-conflict-banner"><AlertTriangle size={18} /> {syncConflict}</div>}
+        {syncConflict && <div className="sync-conflict-banner"><AlertTriangle size={18} /><span>{syncConflict}</span><button className="secondary-button compact" onClick={() => void retryNeedsAttention()}>Retry sync</button></div>}
         {tab === 'sell' && <SellView products={data.products} customers={data.customers} allowProductCreation={canManageStore} />}
         {tab === 'inventory' && canManageStore && <InventoryView products={data.products} />}
         {tab === 'utang' && canManageStore && <UtangView customers={data.customers} entries={data.utangEntries} />}
@@ -338,7 +356,7 @@ export function SellView({ products, customers, allowProductCreation }: { produc
       <button className="mobile-cart-bar" disabled={!cart.length} onClick={() => setCartOpen(true)}><span><ShoppingBasket /> {cart.length} {cart.length === 1 ? 'product' : 'products'}</span><strong>{formatPeso(total)}</strong><ChevronDown /></button>
       {checkout && <CheckoutModal total={total} customers={customers} onClose={() => setCheckout(false)} onComplete={async (paymentMethod, cashReceived, customerId) => {
         const result = await completeSale({ cart, paymentMethod, cashReceived, customerId });
-        setCart([]); setCartIssues({}); setCheckout(false); setNotice(`Sale saved${result.change ? ` · Change ${formatPeso(result.change)}` : ''}`);
+        setCart([]); setCartIssues({}); setCheckout(false); setNotice(`Sale completed${result.change ? ` · Change ${formatPeso(result.change)}` : ''}`);
       }} />}
       {scanner && <CameraScanner onCode={handleBarcode} onClose={() => setScanner(false)} suggestions={barcodeSuggestions} suggestionLabel="Product barcodes" />}
       {unknownBarcode && allowProductCreation && <ConfirmModal title="Barcode not found" description="No product is registered with this barcode. Would you like to add it now?" confirmLabel="Add product" onClose={() => setUnknownBarcode(null)} onConfirm={() => { const code = unknownBarcode; setUnknownBarcode(null); setNewProductBarcode(code); }}><p className="barcode-confirmation"><span>BARCODE</span><strong>{unknownBarcode}</strong></p></ConfirmModal>}
@@ -542,6 +560,7 @@ export function MoreView({ expenses, session, canManageStore, onLogout }: {
 }) {
   const [message, setMessage] = useState('');
   const [managerAccessMessage, setManagerAccessMessage] = useState('');
+  const [confirmLocalRemoval, setConfirmLocalRemoval] = useState(false);
   const managerAccessDenied = Boolean(managerAccessMessage);
 
   const handleManagerAccessDenied = (nextMessage: string) => {
@@ -552,7 +571,7 @@ export function MoreView({ expenses, session, canManageStore, onLogout }: {
     return <section className="page-panel"><div className="page-header"><div><p className="eyebrow">SESSION</p><h1>Account</h1><p>Signed in to a shared store device.</p></div></div><div className="more-grid"><section className="settings-card"><div className="section-heading"><div><p className="eyebrow">ACTIVE USER</p><h2>{session.user.displayName}</h2></div><Cloud /></div><div className="backup-status"><span>Role</span><strong>{session.user.role.toUpperCase()}</strong><span>{session.user.staffCode || session.user.email || 'Shared browser session'}</span></div><div className="backup-status"><span>Store</span><strong>{session.store.name}</strong><span>Browser cache remains available after the first sync.</span></div><button className="danger-button" onClick={() => void onLogout()}><LogOut size={18} /> End cashier shift</button></section></div></section>;
   }
 
-  return <section className="page-panel"><div className="page-header"><div><p className="eyebrow">STORE TOOLS</p><h1>More</h1><p>Expenses, backups, staff, and recovery operations.</p></div></div>{managerAccessMessage && <p className="form-message error" role="alert">{managerAccessMessage}</p>}<div className="more-grid"><section className="settings-card"><div className="section-heading"><div><p className="eyebrow">STORE COSTS</p><h2>Record expense</h2></div><ReceiptText /></div><form className="stack-form" onSubmit={async (event) => { event.preventDefault(); const form = event.currentTarget; const values = new FormData(form); setMessage(''); try { await recordExpense({ category: values.get('category')!.toString(), description: values.get('description')!.toString(), amount: pesoInputToCentavos(values.get('amount')!.toString()), occurredAt: new Date().toISOString() }); form.reset(); setMessage('Expense saved.'); } catch (error) { if (isManagerAccessDenied(error)) { handleManagerAccessDenied(error instanceof Error ? error.message : 'You do not have access to this action'); return; } setMessage(error instanceof Error ? error.message : 'Could not save expense'); } }}><label>Category<select name="category" disabled={managerAccessDenied}><option>Store supplies</option><option>Transportation</option><option>Utilities</option><option>Delivery</option><option>Repairs</option><option>Miscellaneous</option></select></label><label>Description<input name="description" placeholder="Plastic bags, delivery fare…" required disabled={managerAccessDenied} /></label><label>Amount<input name="amount" type="number" min="0.01" step="0.01" required disabled={managerAccessDenied} /></label><button className="primary-button" disabled={managerAccessDenied}><Plus /> Save expense</button>{message && <p className="form-message">{message}</p>}</form><div className="recent-expenses"><strong>Recent expenses</strong>{expenses.slice().sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)).slice(0, 4).map((expense) => <div key={expense.id}><span>{expense.description}<small>{expense.category}</small></span><b>{formatPeso(expense.amount)}</b></div>)}</div></section><BackupPanel disabled={managerAccessDenied} onAccessDenied={handleManagerAccessDenied} /><StaffPanel disabled={managerAccessDenied} onAccessDenied={handleManagerAccessDenied} /><section className="settings-card"><div className="section-heading"><div><p className="eyebrow">SESSION</p><h2>Current access</h2></div><Cloud /></div><div className="backup-status"><span>Signed in as</span><strong>{session.user.displayName}</strong><span>{session.user.role.toUpperCase()} · {session.user.email || session.user.staffCode || 'Shared browser session'}</span></div><button className="danger-button" onClick={() => void onLogout()}><LogOut size={18} /> Sign out</button></section></div></section>;
+  return <><section className="page-panel"><div className="page-header"><div><p className="eyebrow">STORE TOOLS</p><h1>More</h1><p>Expenses, backups, staff, and recovery operations.</p></div></div>{managerAccessMessage && <p className="form-message error" role="alert">{managerAccessMessage}</p>}<div className="more-grid"><section className="settings-card"><div className="section-heading"><div><p className="eyebrow">STORE COSTS</p><h2>Record expense</h2></div><ReceiptText /></div><form className="stack-form" onSubmit={async (event) => { event.preventDefault(); const form = event.currentTarget; const values = new FormData(form); setMessage(''); try { await recordExpense({ category: values.get('category')!.toString(), description: values.get('description')!.toString(), amount: pesoInputToCentavos(values.get('amount')!.toString()), occurredAt: new Date().toISOString() }); form.reset(); setMessage('Expense saved.'); } catch (error) { if (isManagerAccessDenied(error)) { handleManagerAccessDenied(error instanceof Error ? error.message : 'You do not have access to this action'); return; } setMessage(error instanceof Error ? error.message : 'Could not save expense'); } }}><label>Category<select name="category" disabled={managerAccessDenied}><option>Store supplies</option><option>Transportation</option><option>Utilities</option><option>Delivery</option><option>Repairs</option><option>Miscellaneous</option></select></label><label>Description<input name="description" placeholder="Plastic bags, delivery fare…" required disabled={managerAccessDenied} /></label><label>Amount<input name="amount" type="number" min="0.01" step="0.01" required disabled={managerAccessDenied} /></label><button className="primary-button" disabled={managerAccessDenied}><Plus /> Save expense</button>{message && <p className="form-message">{message}</p>}</form><div className="recent-expenses"><strong>Recent expenses</strong>{expenses.slice().sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)).slice(0, 4).map((expense) => <div key={expense.id}><span>{expense.description}<small>{expense.category}</small></span><b>{formatPeso(expense.amount)}</b></div>)}</div></section><BackupPanel disabled={managerAccessDenied} onAccessDenied={handleManagerAccessDenied} /><StaffPanel disabled={managerAccessDenied} onAccessDenied={handleManagerAccessDenied} /><section className="settings-card"><div className="section-heading"><div><p className="eyebrow">SESSION</p><h2>Current access</h2></div><Cloud /></div><div className="backup-status"><span>Signed in as</span><strong>{session.user.displayName}</strong><span>{session.user.role.toUpperCase()} · {session.user.email || session.user.staffCode || 'Shared browser session'}</span></div><button className="danger-button" onClick={() => void onLogout()}><LogOut size={18} /> Sign out</button>{session.user.role === 'owner' && <div className="restore-box"><p className="muted">Signing out keeps offline sales on this device. Only use local-data removal when this browser is being retired or reset.</p><button className="danger-button" onClick={() => setConfirmLocalRemoval(true)}><Trash2 size={18} /> Remove this device’s local data</button></div>}</section></div></section>{confirmLocalRemoval && <ConfirmModal title="Remove local device data?" description="This permanently removes cached products, sales, pending sync commands, and images from this browser. Confirm that all sales are synchronized first." confirmLabel="Remove local data" tone="danger" onClose={() => setConfirmLocalRemoval(false)} onConfirm={async () => { await removeLocalStoreData(); setConfirmLocalRemoval(false); await onLogout(); }} />}</>;
 }
 
 function localDateKey(value: Date) {

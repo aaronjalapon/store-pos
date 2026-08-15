@@ -39,6 +39,10 @@ interface CustomerRow {
   name: string;
 }
 
+interface ProcessedCommandRow {
+  result_json: Record<string, unknown> | null;
+}
+
 @Injectable()
 export class PosService {
   constructor(
@@ -57,29 +61,63 @@ export class PosService {
 
     try {
       const result = await this.database.transaction(async (client) => {
+        const claim = await client.query(
+          `INSERT INTO processed_commands
+           (store_id, device_id, client_command_id, command_type, result_json)
+           VALUES ($1, $2, $3, $4, NULL)
+           ON CONFLICT (store_id, device_id, client_command_id) DO NOTHING
+           RETURNING client_command_id`,
+          [principal.storeId, principal.deviceId, request.clientCommandId, request.command.type],
+        );
+        if (!claim.rows[0]) {
+          const existing = await client.query<ProcessedCommandRow>(
+            `SELECT result_json
+               FROM processed_commands
+              WHERE store_id = $1 AND device_id = $2 AND client_command_id = $3`,
+            [principal.storeId, principal.deviceId, request.clientCommandId],
+          );
+          if (!existing.rows[0]?.result_json) throw new Error('Processed command result is unavailable');
+          return existing.rows[0].result_json;
+        }
+
+        let commandResult: Record<string, unknown>;
         switch (request.command.type) {
           case 'saveProduct':
             this.requireRole(principal, ['owner', 'admin']);
-            return this.saveProduct(client, principal, request.command);
+            commandResult = await this.saveProduct(client, principal, request.command);
+            break;
           case 'completeSale':
-            return this.completeSale(client, principal, request.command);
+            commandResult = await this.completeSale(client, principal, request.command);
+            break;
           case 'adjustStock':
             this.requireRole(principal, ['owner', 'admin']);
-            return this.adjustStock(client, principal, request.command.payload.productId, request.command.payload.newQuantity, request.command.payload.note, request.command.payload.expectedVersion);
+            commandResult = await this.adjustStock(client, principal, request.command.payload.productId, request.command.payload.newQuantity, request.command.payload.note, request.command.payload.expectedVersion);
+            break;
           case 'restockProduct':
             this.requireRole(principal, ['owner', 'admin']);
-            return this.restockProduct(client, principal, request.command.payload.productId, request.command.payload.mode, request.command.payload.quantity, request.command.payload.note, request.command.payload.expectedVersion);
+            commandResult = await this.restockProduct(client, principal, request.command.payload.productId, request.command.payload.mode, request.command.payload.quantity, request.command.payload.note, request.command.payload.expectedVersion);
+            break;
           case 'createCustomer':
-            return this.createCustomer(client, principal, request.command.payload.name);
+            commandResult = await this.createCustomer(client, principal, request.command.payload.name);
+            break;
           case 'recordUtangPayment':
             this.requireRole(principal, ['owner', 'admin']);
-            return this.recordUtangPayment(client, principal, request.command.payload.customerId, request.command.payload.amount, request.command.payload.note);
+            commandResult = await this.recordUtangPayment(client, principal, request.command.payload.customerId, request.command.payload.amount, request.command.payload.note);
+            break;
           case 'recordExpense':
             this.requireRole(principal, ['owner', 'admin']);
-            return this.recordExpense(client, principal, request.command.payload.category, request.command.payload.description, request.command.payload.amount, request.command.payload.occurredAt);
+            commandResult = await this.recordExpense(client, principal, request.command.payload.category, request.command.payload.description, request.command.payload.amount, request.command.payload.occurredAt);
+            break;
           default:
             throw new ConflictException('Unsupported command');
         }
+        await client.query(
+          `UPDATE processed_commands
+              SET result_json = $4::jsonb, processed_at = now()
+            WHERE store_id = $1 AND device_id = $2 AND client_command_id = $3`,
+          [principal.storeId, principal.deviceId, request.clientCommandId, JSON.stringify(commandResult)],
+        );
+        return commandResult;
       });
       const snapshot = await this.data.loadSnapshot(principal.storeId);
       const cursor = await this.data.currentCursor(principal.storeId);
@@ -191,7 +229,7 @@ export class PosService {
       throw new ConflictException('Select an utang customer');
     }
     const productsResult = await client.query<ProductRow>(
-      'SELECT * FROM products WHERE store_id = $1 AND id = ANY($2::uuid[])',
+      'SELECT * FROM products WHERE store_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE',
       [principal.storeId, command.payload.cart.map((line) => line.productId)],
     );
     const products = new Map(productsResult.rows.map((row) => [row.id, row]));
@@ -199,9 +237,6 @@ export class PosService {
       const product = products.get(line.productId);
       if (!product || !product.is_active) {
         throw new StaleConflict('not_found', 'One of the products in this sale is no longer available.');
-      }
-      if (product.record_version !== line.expectedVersion) {
-        throw new StaleConflict('stale_product', `${product.name} changed on another device. Refresh before completing the sale.`);
       }
       return this.prepareSaleLine(product, line);
     });
@@ -213,9 +248,9 @@ export class PosService {
       : null;
     if (command.payload.paymentMethod === 'cash' && change === null) throw new ConflictException('Cash received is less than the total');
 
-    const saleId = crypto.randomUUID();
-    const now = new Date().toISOString();
-    const transactionNumber = `POS-${now.slice(0, 10).replaceAll('-', '')}-${saleId.slice(0, 6).toUpperCase()}`;
+    const saleId = command.payload.saleId;
+    const now = command.payload.occurredAt;
+    const transactionNumber = command.payload.transactionNumber;
     await client.query(
       `INSERT INTO sales
        (id, store_id, transaction_number, customer_id, cashier_user_id, device_id, subtotal, discount, total,

@@ -3,8 +3,8 @@
 import { useEffect, useState } from 'react';
 import type { AuthSession } from '@gma/contracts';
 import { AlertTriangle, KeyRound, ShieldCheck, Store, Users } from 'lucide-react';
-import { fetchSetupStatus, loginCashier, loginOwner, logout, rehydrateSession, setupOwner } from '../lib/api';
-import { getActiveStoreId, getSession, hasCompletedBootstrap, resetLocalStoreForLogout } from '../lib/db';
+import { fetchSetupStatus, isInvalidSessionError, loginCashier, loginOwner, logout, rehydrateSession, setupOwner } from '../lib/api';
+import { getActiveStoreId, getSession, hasCompletedBootstrap, signOutLocally } from '../lib/db';
 import { PosApp } from './pos-app';
 import { SuperadminConsole } from './superadmin-console';
 
@@ -43,14 +43,19 @@ export function AuthShell() {
           setSession(next ?? localSession);
           setMode('owner');
           return;
-        } catch {
+        } catch (error) {
           if (!active) return;
-          await resetLocalStoreForLogout();
-          if (!active) return;
-          setSession(null);
-          setOfflineReady(false);
-          setMode('owner');
-          setMessage('Your saved superadmin session no longer matches the server. Please sign in again.');
+          if (isInvalidSessionError(error)) {
+            await signOutLocally();
+            if (!active) return;
+            setSession(null);
+            setOfflineReady(false);
+            setMode('owner');
+            setMessage('Your saved superadmin session is no longer valid. Please sign in again.');
+          } else {
+            setSession(localSession);
+            setMode('owner');
+          }
           return;
         }
       }
@@ -67,22 +72,19 @@ export function AuthShell() {
           setSession(next ?? localSession);
           setMode('owner');
           return;
-        } catch {
+        } catch (error) {
           if (!active) return;
-          await resetLocalStoreForLogout();
-          if (!active) return;
-          setSession(null);
-          setOfflineReady(false);
-          setKnownStoreId('');
-          try {
-            const status = await fetchSetupStatus();
+          if (isInvalidSessionError(error)) {
+            await signOutLocally();
             if (!active) return;
-            setMode(status.needsSetup ? 'setup' : 'owner');
-            setMessage('Your saved browser session no longer matches the server. Please sign in again.');
-          } catch (error) {
-            if (!active) return;
+            setSession(null);
+            setOfflineReady(false);
             setMode('owner');
-            setMessage(error instanceof Error ? error.message : 'Could not reach the server');
+            setMessage('Your saved browser session is no longer valid. Local sales remain on this device; sign in again to sync them.');
+          } else {
+            setSession(localSession);
+            setOfflineReady(true);
+            setMode('owner');
           }
           return;
         }

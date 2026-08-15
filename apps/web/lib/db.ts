@@ -24,6 +24,10 @@ export interface MutationQueueItem {
   id: string;
   request: StoreCommandRequest;
   createdAt: string;
+  status: 'pending' | 'syncing' | 'needs_attention';
+  attemptCount: number;
+  lastAttemptAt: string | null;
+  errorMessage: string | null;
 }
 
 export interface ProductImageRecord {
@@ -72,6 +76,26 @@ export class PosDatabase extends Dexie {
       mutationQueue: 'id, createdAt',
       productImages: 'productId, revision, syncStatus, updatedAt',
       productImageQueue: 'id, operation, productId, revision',
+    });
+    this.version(5).stores({
+      products: 'id, &barcode, name, category, isQuickItem, isActive, updatedAt, recordVersion',
+      sales: 'id, transactionNumber, createdAt, paymentMethod, customerId, cashierUserId',
+      saleItems: 'id, saleId, productId, createdAt',
+      inventoryMovements: 'id, productId, saleId, createdAt',
+      customers: 'id, name, isActive, updatedAt, recordVersion',
+      utangEntries: 'id, customerId, saleId, createdAt',
+      expenses: 'id, category, occurredAt, createdAt',
+      settings: 'key',
+      mutationQueue: 'id, status, createdAt',
+      productImages: 'productId, revision, syncStatus, updatedAt',
+      productImageQueue: 'id, operation, productId, revision',
+    }).upgrade(async (transaction) => {
+      await transaction.table<MutationQueueItem>('mutationQueue').toCollection().modify((item) => {
+        item.status = item.status ?? 'pending';
+        item.attemptCount = item.attemptCount ?? 0;
+        item.lastAttemptAt = item.lastAttemptAt ?? null;
+        item.errorMessage = item.errorMessage ?? null;
+      });
     });
   }
 }
@@ -148,11 +172,12 @@ export async function clearSession() {
   ]);
 }
 
-export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: number) {
-  await db.transaction(
+export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: number, skipWhenQueued = false) {
+  const replaced = await db.transaction(
     'rw',
-    [db.products, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.settings],
+    [db.products, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.settings, db.mutationQueue],
     async () => {
+      if (skipWhenQueued && await db.mutationQueue.count() > 0) return false;
       await Promise.all([
         db.products.clear(),
         db.sales.clear(),
@@ -173,17 +198,27 @@ export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: numb
       ]);
       await setSetting(CURSOR_KEY, cursor);
       await setSetting(BOOTSTRAP_KEY, true);
+      return true;
     },
   );
-  window.dispatchEvent(new Event('pos-data-changed'));
+  if (replaced) window.dispatchEvent(new Event('pos-data-changed'));
+  return replaced;
 }
 
 export async function applyServerSync(sync: StoreSyncResponse) {
-  await replaceStoreSnapshot(sync.snapshot, sync.cursor);
+  return replaceStoreSnapshot(sync.snapshot, sync.cursor, true);
 }
 
 export async function queueCommand(request: StoreCommandRequest) {
-  await db.mutationQueue.put({ id: request.clientCommandId, request, createdAt: new Date().toISOString() });
+  await db.mutationQueue.put({
+    id: request.clientCommandId,
+    request,
+    createdAt: new Date().toISOString(),
+    status: 'pending',
+    attemptCount: 0,
+    lastAttemptAt: null,
+    errorMessage: null,
+  });
 }
 
 export async function removeQueuedCommand(id: string) {
@@ -192,6 +227,17 @@ export async function removeQueuedCommand(id: string) {
 
 export async function listQueuedCommands() {
   return db.mutationQueue.orderBy('createdAt').toArray();
+}
+
+export async function getMutationQueueSummary() {
+  const items = await listQueuedCommands();
+  return {
+    pendingCount: items.filter((item) => item.status === 'pending' || item.status === 'syncing').length,
+    needsAttentionCount: items.filter((item) => item.status === 'needs_attention').length,
+    pendingSaleCount: items.filter((item) => (item.status === 'pending' || item.status === 'syncing') && item.request.command.type === 'completeSale').length,
+    needsAttentionSaleCount: items.filter((item) => item.status === 'needs_attention' && item.request.command.type === 'completeSale').length,
+    totalCount: items.length,
+  };
 }
 
 export async function setConflictMessage(message: string) {
@@ -219,8 +265,12 @@ export async function getStoreContext() {
   };
 }
 
-export async function resetLocalStoreForLogout() {
-  await db.transaction('rw', [db.products, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.mutationQueue], async () => {
+export async function signOutLocally() {
+  await clearSession();
+}
+
+export async function removeLocalStoreData() {
+  await db.transaction('rw', [db.products, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.mutationQueue, db.productImages, db.productImageQueue], async () => {
     await Promise.all([
       db.products.clear(),
       db.sales.clear(),
@@ -230,6 +280,8 @@ export async function resetLocalStoreForLogout() {
       db.utangEntries.clear(),
       db.expenses.clear(),
       db.mutationQueue.clear(),
+      db.productImages.clear(),
+      db.productImageQueue.clear(),
     ]);
   });
   await clearSession();
@@ -237,3 +289,6 @@ export async function resetLocalStoreForLogout() {
   await setSetting(CURSOR_KEY, 0);
   await clearConflictMessage();
 }
+
+/** @deprecated Use signOutLocally for logout or removeLocalStoreData for intentional device erasure. */
+export const resetLocalStoreForLogout = removeLocalStoreData;

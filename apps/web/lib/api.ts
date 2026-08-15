@@ -24,25 +24,49 @@ import type {
 import {
   applyServerSync,
   clearConflictMessage,
-  clearSession,
   getActiveStoreId,
   getConflictMessage,
+  getMutationQueueSummary,
   getOrCreateDeviceId,
   getSession,
   getSessionToken,
   getSyncCursor,
+  hasCompletedBootstrap,
   listQueuedCommands,
-  queueCommand,
   removeQueuedCommand,
   replaceStoreSnapshot,
-  resetLocalStoreForLogout,
   saveSession,
   setConflictMessage,
   setDeviceName,
+  signOutLocally,
+  db,
 } from './db';
+import { flushProductImageDeletes, flushProductImageUploads } from './product-images';
 
 const API_DEFAULT = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
 const MANAGER_ACCESS_DENIED_MESSAGE = 'You do not have access to this action';
+
+export interface SyncState {
+  phase: 'synced' | 'offline' | 'syncing' | 'pending' | 'needs_attention';
+  pendingCount: number;
+  needsAttentionCount: number;
+  pendingSaleCount: number;
+  needsAttentionSaleCount: number;
+  completedCount: number;
+  totalCount: number;
+}
+
+let syncPromise: Promise<void> | null = null;
+let syncRequestedAgain = false;
+let activeSyncState: Pick<SyncState, 'completedCount' | 'totalCount'> = { completedCount: 0, totalCount: 0 };
+let serverAvailable = true;
+
+export class ApiRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
 
 export function normalizeApiUrl(value = API_DEFAULT) {
   return value.replace(/\/$/, '');
@@ -50,6 +74,10 @@ export function normalizeApiUrl(value = API_DEFAULT) {
 
 export function isManagerAccessDenied(error: unknown) {
   return error instanceof Error && error.message === MANAGER_ACCESS_DENIED_MESSAGE;
+}
+
+export function isInvalidSessionError(error: unknown) {
+  return error instanceof ApiRequestError && (error.status === 401 || error.status === 403);
 }
 
 export async function fetchSetupStatus(apiUrl = API_DEFAULT) {
@@ -104,6 +132,15 @@ export async function rehydrateSession(apiUrl = API_DEFAULT) {
 }
 
 export async function bootstrapStore(storeId: string, token: string, apiUrl = API_DEFAULT) {
+  const [bootstrapped, queue] = await Promise.all([hasCompletedBootstrap(), getMutationQueueSummary()]);
+  if (bootstrapped && queue.totalCount > 0) {
+    await requestSync(apiUrl);
+    const remaining = await getMutationQueueSummary();
+    if (remaining.totalCount > 0) {
+      const localSession = await getSession();
+      if (localSession?.store) return localSession;
+    }
+  }
   const response = await apiRequest<StoreBootstrapResponse>(normalizeApiUrl(apiUrl), `/v1/stores/${storeId}/bootstrap`, {
     headers: { authorization: `Bearer ${token}` },
   });
@@ -117,6 +154,7 @@ export async function bootstrapStore(storeId: string, token: string, apiUrl = AP
 export async function syncStore(apiUrl = API_DEFAULT) {
   const [session, token] = await Promise.all([getSession(), getSessionToken()]);
   if (!session?.store || !token) return null;
+  if ((await getMutationQueueSummary()).totalCount > 0) return null;
   const response = await apiRequest<StoreSyncResponse>(normalizeApiUrl(apiUrl), `/v1/stores/${session.store.id}/sync`, {
     headers: { authorization: `Bearer ${token}` },
   });
@@ -136,50 +174,132 @@ export async function logout(apiUrl = API_DEFAULT) {
       // ignore network errors during logout; local session still clears
     }
   }
-  await resetLocalStoreForLogout();
+  await signOutLocally();
 }
 
-export async function enqueueAndMaybeFlush(command: StoreCommand, apiUrl = API_DEFAULT) {
-  const request: StoreCommandRequest = {
+export async function createCommandRequest(command: StoreCommand): Promise<StoreCommandRequest> {
+  return {
     clientCommandId: crypto.randomUUID(),
     baseCursor: await getSyncCursor(),
     command,
   };
-  await queueCommand(request);
-  if (typeof navigator !== 'undefined' && navigator.onLine) {
-    return flushMutationQueue(apiUrl, request.clientCommandId);
+}
+
+export async function getSyncState(): Promise<SyncState> {
+  const summary = await getMutationQueueSummary();
+  const online = typeof navigator === 'undefined' || navigator.onLine;
+  const phase = summary.needsAttentionCount > 0
+    ? 'needs_attention'
+    : syncPromise
+      ? 'syncing'
+      : summary.pendingCount > 0
+        ? (online ? 'pending' : 'offline')
+        : online && serverAvailable ? 'synced' : 'offline';
+  return { phase, ...summary, ...activeSyncState };
+}
+
+export function requestSync(apiUrl = API_DEFAULT) {
+  if (syncPromise) {
+    syncRequestedAgain = true;
+    return syncPromise;
   }
+  syncPromise = (async () => {
+    do {
+      syncRequestedAgain = false;
+      try {
+        await runSync(apiUrl);
+      } catch {
+        // Local commands are already durable. A coordinator failure must never
+        // surface as an unhandled rejection or make the cashier repeat a sale.
+        break;
+      }
+    } while (syncRequestedAgain);
+  })().finally(() => {
+    syncPromise = null;
+    activeSyncState = { completedCount: 0, totalCount: 0 };
+    dispatchSyncStateChanged();
+  });
+  dispatchSyncStateChanged();
+  return syncPromise;
+}
+
+export async function flushMutationQueue(apiUrl = API_DEFAULT) {
+  await requestSync(apiUrl);
   return null;
 }
 
-export async function flushMutationQueue(apiUrl = API_DEFAULT, stopAfterId?: string) {
+export async function retryNeedsAttention(apiUrl = API_DEFAULT) {
+  await db.mutationQueue.where('status').equals('needs_attention').modify({
+    status: 'pending',
+    errorMessage: null,
+  });
+  await clearConflictMessage();
+  dispatchSyncStateChanged();
+  await requestSync(apiUrl);
+}
+
+async function runSync(apiUrl: string) {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    dispatchSyncStateChanged();
+    return;
+  }
   const [session, token] = await Promise.all([getSession(), getSessionToken()]);
-  if (!session?.store || !token) return null;
+  if (!session?.store || !token) return;
   const queued = await listQueuedCommands();
-  for (const item of queued) {
+  activeSyncState = { completedCount: 0, totalCount: queued.length };
+  dispatchSyncStateChanged();
+  for (let index = 0; index < queued.length; index += 1) {
+    const item = queued[index];
+    if (item.status === 'needs_attention') break;
+    const attemptedAt = new Date().toISOString();
+    await db.mutationQueue.update(item.id, {
+      status: 'syncing',
+      attemptCount: item.attemptCount + 1,
+      lastAttemptAt: attemptedAt,
+      errorMessage: null,
+    });
+    dispatchSyncStateChanged();
     try {
       const response = await apiRequest<StoreCommandResponse>(normalizeApiUrl(apiUrl), `/v1/stores/${session.store.id}/commands`, {
         method: 'POST',
         headers: { authorization: `Bearer ${token}` },
         body: JSON.stringify(item.request),
       });
-      await replaceStoreSnapshot(response.snapshot, response.cursor);
-      await removeQueuedCommand(item.id);
       if (response.status === 'conflict') {
+        await db.mutationQueue.update(item.id, { status: 'needs_attention', errorMessage: response.message });
         await setConflictMessage(response.message);
-        if (!stopAfterId || stopAfterId === item.id) return response;
         break;
       }
+      await removeQueuedCommand(item.id);
       await clearConflictMessage();
-      if (stopAfterId && stopAfterId === item.id) return response;
+      activeSyncState = { completedCount: index + 1, totalCount: queued.length };
+      dispatchSyncStateChanged();
     } catch (error) {
-      if (stopAfterId && isManagerAccessDenied(error)) {
-        throw error;
-      }
+      const permanent = error instanceof ApiRequestError && error.status >= 400 && error.status < 500 && error.status !== 401 && error.status !== 408 && error.status !== 429;
+      const message = error instanceof Error ? error.message : 'Could not reach the server';
+      await db.mutationQueue.update(item.id, { status: permanent ? 'needs_attention' : 'pending', errorMessage: message });
+      if (permanent) await setConflictMessage(message);
       break;
     }
   }
-  return null;
+  const remaining = await getMutationQueueSummary();
+  if (remaining.totalCount > 0) {
+    dispatchSyncStateChanged();
+    return;
+  }
+  try {
+    await syncStore(apiUrl);
+  } catch {
+    dispatchSyncStateChanged();
+    return;
+  }
+  await flushProductImageUploads();
+  await flushProductImageDeletes();
+  dispatchSyncStateChanged();
+}
+
+function dispatchSyncStateChanged() {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('pos-sync-state-changed'));
 }
 
 export async function listStaff(apiUrl = API_DEFAULT) {
@@ -270,11 +390,16 @@ async function apiAuthed<T>(path: string, init: RequestInit = {}, apiUrl = API_D
 async function apiRequest<T = unknown>(baseUrl: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers || {});
   if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...init,
-    headers,
-  });
-  if (!response.ok) throw new Error(await readableApiError(response));
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, { ...init, headers });
+    serverAvailable = true;
+  } catch (error) {
+    serverAvailable = false;
+    dispatchSyncStateChanged();
+    throw error;
+  }
+  if (!response.ok) throw new ApiRequestError(await readableApiError(response), response.status);
   if (response.status === 204) return undefined as T;
   return await response.json() as T;
 }

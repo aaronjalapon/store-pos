@@ -35,6 +35,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .session-pill span { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .08em; }
 .content-area { width: min(1440px, 100%); margin: auto; }
 .sync-conflict-banner { margin: 18px clamp(20px, 4vw, 60px) 0; padding: 12px 14px; border-radius: 12px; background: #fff0ed; color: var(--red); display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 700; }
+.sync-conflict-banner > span { flex: 1; }
 
 .auth-shell { min-height: 100dvh; display: grid; place-items: center; padding: 26px; background: radial-gradient(circle at 10% 0%, #ffffff 0, transparent 35%), linear-gradient(135deg, #f7f5ef 0%, #eef4ef 100%); }
 .auth-panel { width: min(560px, 100%); padding: 28px; border: 1px solid var(--line); border-radius: 28px; background: rgb(255 253 248 / 92%); box-shadow: var(--shadow); }

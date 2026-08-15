@@ -7,8 +7,8 @@ import type {
   Product,
   StoreCommand,
 } from '@gma/contracts';
-import { db, getStoreContext } from './db';
-import { enqueueAndMaybeFlush } from './api';
+import { db, getStoreContext, queueCommand } from './db';
+import { createCommandRequest, requestSync } from './api';
 
 export interface ProductImageInput {
   revision: string;
@@ -51,10 +51,15 @@ function validateStockQuantity(product: Pick<Product, 'soldByWeight' | 'quantity
 }
 
 async function applyLocalCommand<T>(command: StoreCommand, optimistic: () => Promise<T>) {
-  const result = await optimistic();
+  const request = await createCommandRequest(command);
+  const result = await db.transaction('rw', db.tables, async () => {
+    const optimisticResult = await optimistic();
+    await queueCommand(request);
+    return optimisticResult;
+  });
   window.dispatchEvent(new Event('pos-data-changed'));
-  const response = await enqueueAndMaybeFlush(command);
-  if (response?.status === 'conflict') throw new Error(response.message);
+  window.dispatchEvent(new Event('pos-sync-state-changed'));
+  void requestSync();
   return result;
 }
 
@@ -65,10 +70,13 @@ export async function completeSale(input: CompleteSaleInput) {
   const context = await getStoreContext();
   const now = new Date().toISOString();
   const saleId = crypto.randomUUID();
-  const transactionNumber = `POS-${now.slice(0, 10).replaceAll('-', '')}-${saleId.slice(0, 6).toUpperCase()}`;
+  const transactionNumber = `POS-${now.slice(0, 10).replaceAll('-', '')}-${saleId.toUpperCase()}`;
   const command: StoreCommand = {
     type: 'completeSale',
     payload: {
+      saleId,
+      transactionNumber,
+      occurredAt: now,
       paymentMethod: input.paymentMethod,
       cashReceived: input.cashReceived,
       customerId: input.customerId,
