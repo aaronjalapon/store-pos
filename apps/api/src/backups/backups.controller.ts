@@ -1,4 +1,5 @@
 import { Controller, ForbiddenException, Get, Param, ParseUUIDPipe, Post, Req, UseGuards } from '@nestjs/common';
+import { managerRoles } from '@gma/contracts';
 import type { FastifyRequest } from 'fastify';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
@@ -7,7 +8,7 @@ import { BackupsService } from './backups.service';
 
 @Controller('stores/:storeId/backups')
 @UseGuards(SessionAuthGuard, RolesGuard)
-@Roles('owner', 'admin')
+@Roles(...managerRoles)
 export class BackupsController {
   constructor(private readonly backups: BackupsService) {}
 

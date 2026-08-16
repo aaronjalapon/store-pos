@@ -3,12 +3,24 @@ import { z } from 'zod';
 export const roles = ['superadmin', 'owner', 'admin', 'cashier'] as const;
 export type Role = (typeof roles)[number];
 export type StoreRole = Exclude<Role, 'superadmin'>;
+export const managerRoles = ['owner', 'admin'] as const;
+export type ManagerRole = (typeof managerRoles)[number];
+
+export function isManagerRole(role: Role): role is ManagerRole {
+  return managerRoles.includes(role as ManagerRole);
+}
 
 export const paymentMethods = ['cash', 'gcash', 'maya', 'utang', 'other'] as const;
 export type PaymentMethod = (typeof paymentMethods)[number];
 
 export const inventoryMovementReasons = ['sale', 'restock', 'adjustment', 'void'] as const;
 export type InventoryMovementReason = (typeof inventoryMovementReasons)[number];
+
+export const inventoryAdjustmentReasons = [
+  'physical_count', 'damage', 'spillage', 'supplier_shortage', 'personal_use',
+  'store_use', 'theft', 'count_correction', 'other',
+] as const;
+export type InventoryAdjustmentReason = (typeof inventoryAdjustmentReasons)[number];
 
 export const commandStatuses = ['applied', 'conflict'] as const;
 export type CommandStatus = (typeof commandStatuses)[number];
@@ -89,6 +101,31 @@ export interface Product extends RecordBase {
   lowStockThreshold: number;
   isQuickItem: boolean;
   isActive: boolean;
+  /** Canonical inventory fields. Legacy display-unit fields remain during migration. */
+  baseUnit?: string;
+  baseUnitId?: string | null;
+  stockBaseQuantity?: number;
+  lowStockBaseThreshold?: number;
+  defaultSaleUnitId?: string | null;
+  defaultRestockUnitId?: string | null;
+  displayUnitId?: string | null;
+}
+
+export interface ProductUnit extends RecordBase {
+  productId: string;
+  name: string;
+  symbol: string | null;
+  multiplierBaseUnits: number;
+  quantityStep: number;
+  canSell: boolean;
+  canRestock: boolean;
+  allowAmountPricing: boolean;
+  sellingPrice: number | null;
+  costPrice: number | null;
+  barcode: string | null;
+  isBase: boolean;
+  isActive: boolean;
+  replacesUnitId: string | null;
 }
 
 export interface Sale extends RecordBase {
@@ -112,6 +149,12 @@ export interface SaleItem extends RecordBase {
   unitPrice: number;
   costPriceSnapshot: number;
   subtotal: number;
+  productUnitId?: string | null;
+  inputQuantity?: number;
+  unitNameSnapshot?: string | null;
+  unitSymbolSnapshot?: string | null;
+  multiplierBaseUnitsSnapshot?: number | null;
+  baseQuantity?: number;
 }
 
 export interface InventoryMovement extends RecordBase {
@@ -123,6 +166,15 @@ export interface InventoryMovement extends RecordBase {
   note: string | null;
   actorUserId: string;
   deviceId: string;
+  productUnitId?: string | null;
+  inputMode?: 'delta' | 'absolute';
+  inputQuantity?: number | null;
+  inputUnitSnapshot?: string | null;
+  multiplierBaseUnitsSnapshot?: number | null;
+  baseQuantityDelta?: number;
+  stockAfterBase?: number;
+  adjustmentReason?: InventoryAdjustmentReason | null;
+  actorDisplayNameSnapshot?: string | null;
 }
 
 export interface Customer extends RecordBase {
@@ -172,15 +224,21 @@ export interface StaffMember {
 export interface SuperadminStoreSummary {
   id: string;
   name: string;
+  isActive: boolean;
   ownerCount: number;
   adminCount: number;
   cashierCount: number;
+  lastActivityAt: string | null;
+  lastDeviceSeenAt: string | null;
+  latestBackupAt: string | null;
+  backupCount: number;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface StoreSnapshot {
   products: Product[];
+  productUnits?: ProductUnit[];
   sales: Sale[];
   saleItems: SaleItem[];
   inventoryMovements: InventoryMovement[];
@@ -258,10 +316,30 @@ export interface SuperadminStoreListResponse {
   stores: SuperadminStoreSummary[];
 }
 
+export interface SuperadminStoreDetailsResponse {
+  store: SuperadminStoreSummary;
+  staff: StaffMember[];
+}
+
 export interface SuperadminStoreMutationResponse {
   store: SuperadminStoreSummary;
   staff: StaffMember;
 }
+
+export const superadminStoreStatusSchema = z.object({
+  isActive: z.boolean(),
+});
+export type SuperadminStoreStatusRequest = z.infer<typeof superadminStoreStatusSchema>;
+
+export const superadminStaffStatusSchema = z.object({
+  isActive: z.boolean(),
+});
+export type SuperadminStaffStatusRequest = z.infer<typeof superadminStaffStatusSchema>;
+
+export const superadminResetStaffSecretSchema = z.object({
+  password: z.string().min(8).max(200),
+});
+export type SuperadminResetStaffSecretRequest = z.infer<typeof superadminResetStaffSecretSchema>;
 
 export interface AuthSessionResponse {
   session: AuthSession;
@@ -322,6 +400,28 @@ export const saveProductCommandSchema = z.object({
     lowStockThreshold: z.number().min(0),
     isQuickItem: z.boolean(),
     isActive: z.boolean().default(true),
+    baseUnit: z.string().trim().min(1).max(40).optional(),
+    stockBaseQuantity: z.number().int().min(0).optional(),
+    lowStockBaseThreshold: z.number().int().min(0).optional(),
+    defaultSaleUnitId: z.string().uuid().nullable().optional(),
+    defaultRestockUnitId: z.string().uuid().nullable().optional(),
+    displayUnitId: z.string().uuid().nullable().optional(),
+    units: z.array(z.object({
+      id: z.string().uuid().optional(),
+      name: z.string().trim().min(1).max(80),
+      symbol: z.string().trim().max(20).nullable().optional(),
+      multiplierBaseUnits: z.number().int().positive(),
+      quantityStep: z.number().positive(),
+      canSell: z.boolean(),
+      canRestock: z.boolean(),
+      allowAmountPricing: z.boolean().default(false),
+      sellingPrice: z.number().int().min(0).nullable().optional(),
+      costPrice: z.number().int().min(0).nullable().optional(),
+      barcode: z.string().trim().min(1).max(64).nullable().optional(),
+      isBase: z.boolean().default(false),
+      isActive: z.boolean().default(true),
+      replacesUnitId: z.string().uuid().nullable().optional(),
+    })).optional(),
   }),
 });
 
@@ -337,6 +437,8 @@ export const completeSaleCommandSchema = z.object({
     cart: z.array(z.object({
       productId: z.string().uuid(),
       quantity: z.number().positive(),
+      productUnitId: z.string().uuid().optional(),
+      inputQuantity: z.number().positive().optional(),
       pricingMode: z.enum(['quantity', 'amount']).optional(),
       enteredAmount: z.number().int().positive().nullable().optional(),
       expectedVersion: z.number().int().positive(),
@@ -362,6 +464,39 @@ export const restockProductCommandSchema = z.object({
     quantity: z.number().positive(),
     note: z.string().trim().max(200).default('Quick restock'),
     expectedVersion: z.number().int().positive(),
+  }),
+});
+
+export const receiveStockCommandSchema = z.object({
+  type: z.literal('receiveStock'),
+  payload: z.object({
+    productId: z.string().uuid(),
+    productUnitId: z.string().uuid(),
+    inputQuantity: z.number().positive(),
+    note: z.string().trim().max(200).default('Stock received'),
+  }),
+});
+
+export const countStockCommandSchema = z.object({
+  type: z.literal('countStock'),
+  payload: z.object({
+    productId: z.string().uuid(),
+    productUnitId: z.string().uuid(),
+    inputQuantity: z.number().min(0),
+    reason: z.enum(inventoryAdjustmentReasons),
+    note: z.string().trim().max(200).default('Physical stock count'),
+    expectedVersion: z.number().int().positive(),
+  }),
+});
+
+export const adjustStockDeltaCommandSchema = z.object({
+  type: z.literal('adjustStockDelta'),
+  payload: z.object({
+    productId: z.string().uuid(),
+    productUnitId: z.string().uuid(),
+    inputQuantity: z.number().refine((value) => value !== 0),
+    reason: z.enum(inventoryAdjustmentReasons),
+    note: z.string().trim().max(200).default('Inventory adjustment'),
   }),
 });
 
@@ -397,6 +532,9 @@ export const storeCommandSchema = z.discriminatedUnion('type', [
   completeSaleCommandSchema,
   adjustStockCommandSchema,
   restockProductCommandSchema,
+  receiveStockCommandSchema,
+  countStockCommandSchema,
+  adjustStockDeltaCommandSchema,
   createCustomerCommandSchema,
   recordUtangPaymentCommandSchema,
   recordExpenseCommandSchema,

@@ -1,4 +1,4 @@
-import type { Expense, Sale, SaleItem, UtangEntry } from '@gma/contracts';
+import type { Expense, ProductUnit, Sale, SaleItem, UtangEntry } from '@gma/contracts';
 
 export interface CartLine {
   productId: string;
@@ -51,4 +51,38 @@ export function calculateDailySummary(sales: Sale[], items: SaleItem[], expenses
 
 export function formatPeso(centavos: number) {
   return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(centavos / 100);
+}
+
+export function baseIncrementForUnit(unit: Pick<ProductUnit, 'multiplierBaseUnits' | 'quantityStep'>) {
+  const increment = unit.multiplierBaseUnits * unit.quantityStep;
+  if (!Number.isSafeInteger(Math.round(increment)) || Math.abs(increment - Math.round(increment)) > 0.000001) {
+    throw new Error('Unit quantity step does not resolve to a whole base-unit increment');
+  }
+  return Math.round(increment);
+}
+
+export function convertToBaseUnits(unit: Pick<ProductUnit, 'multiplierBaseUnits' | 'quantityStep'>, inputQuantity: number) {
+  if (!Number.isFinite(inputQuantity) || inputQuantity <= 0) throw new Error('Quantity must be above zero');
+  const base = inputQuantity * unit.multiplierBaseUnits;
+  const increment = baseIncrementForUnit(unit);
+  if (Math.abs(base / increment - Math.round(base / increment)) > 0.000001) {
+    throw new Error(`Quantity must use increments of ${unit.quantityStep}`);
+  }
+  return Math.round(base);
+}
+
+/** Converts an exact peso entry to inventory using nearest allowed base increment, half up. */
+export function pesoToBaseUnits(
+  unit: Pick<ProductUnit, 'multiplierBaseUnits' | 'quantityStep' | 'sellingPrice'>,
+  amountCentavos: number,
+) {
+  if (!unit.sellingPrice || unit.sellingPrice <= 0 || !Number.isInteger(amountCentavos) || amountCentavos <= 0) {
+    throw new Error('A positive unit price and peso amount are required');
+  }
+  const theoreticalInput = amountCentavos / unit.sellingPrice;
+  const increment = baseIncrementForUnit(unit);
+  const theoreticalBase = theoreticalInput * unit.multiplierBaseUnits;
+  const rounded = Math.floor(theoreticalBase / increment + 0.5) * increment;
+  if (rounded <= 0) throw new Error('Peso amount is below the minimum sale increment');
+  return rounded;
 }

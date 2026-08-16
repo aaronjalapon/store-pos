@@ -5,6 +5,7 @@ import type {
   Expense,
   PaymentMethod,
   Product,
+  ProductUnit,
   StoreCommand,
 } from '@gma/contracts';
 import { db, getStoreContext, queueCommand } from './db';
@@ -16,9 +17,12 @@ export interface ProductImageInput {
   contentType: 'image/webp' | 'image/jpeg';
 }
 
+export type ProductUnitInput = Omit<ProductUnit, 'id' | 'storeId' | 'productId' | 'createdAt' | 'updatedAt' | 'recordVersion'> & { id?: string };
+
 export interface CartEntry {
   product: Product;
   quantity: number;
+  unit?: ProductUnit | null;
   pricingMode?: 'quantity' | 'amount';
   enteredAmount?: number | null;
 }
@@ -48,6 +52,15 @@ function validateStockQuantity(product: Pick<Product, 'soldByWeight' | 'quantity
       ? `Stock must use increments of ${quantityStep} ${product.unit}`
       : 'Regular products require a whole-number stock quantity');
   }
+}
+
+function convertInputToBase(unit: ProductUnit, inputQuantity: number) {
+  if (!Number.isFinite(inputQuantity) || inputQuantity <= 0 || !isStepAligned(inputQuantity, unit.quantityStep)) {
+    throw new Error(`Quantity must use increments of ${unit.quantityStep} ${unit.name}`);
+  }
+  const base = inputQuantity * unit.multiplierBaseUnits;
+  if (!Number.isSafeInteger(Math.round(base))) throw new Error('Quantity is too large');
+  return Math.round(base);
 }
 
 async function applyLocalCommand<T>(command: StoreCommand, optimistic: () => Promise<T>) {
@@ -83,6 +96,8 @@ export async function completeSale(input: CompleteSaleInput) {
       cart: input.cart.map((line) => ({
         productId: line.product.id,
         quantity: line.quantity,
+        productUnitId: line.unit?.id,
+        inputQuantity: line.quantity,
         pricingMode: line.pricingMode ?? 'quantity',
         enteredAmount: line.enteredAmount ?? null,
         expectedVersion: line.product.recordVersion,
@@ -92,17 +107,20 @@ export async function completeSale(input: CompleteSaleInput) {
 
   return applyLocalCommand(command, async () => {
     const currentProducts = await db.products.bulkGet(input.cart.map(({ product }) => product.id));
+    const currentUnits = await db.productUnits.bulkGet(input.cart.map(({ unit }) => unit?.id).filter((id): id is string => Boolean(id)));
+    const unitMap = new Map(currentUnits.filter((unit): unit is ProductUnit => Boolean(unit)).map((unit) => [unit.id, unit]));
     const preparedLines = input.cart.map((entry, index) => {
       const current = currentProducts[index];
       if (!current?.isActive) throw new Error(`${entry.product.name} is no longer available`);
-      return prepareCartLine(entry, current);
+      const unit = entry.unit?.id ? unitMap.get(entry.unit.id) ?? entry.unit : undefined;
+      return unit ? prepareCanonicalCartLine(entry, current, unit) : prepareCartLine(entry, current);
     });
     const subtotal = preparedLines.reduce((sum, line) => sum + line.subtotal, 0);
     const total = subtotal;
     const change = input.paymentMethod === 'cash' ? calculateChange(total, input.cashReceived ?? 0) : null;
     if (input.paymentMethod === 'cash' && change === null) throw new Error('Cash received is less than the total');
 
-    await db.transaction('rw', [db.products, db.sales, db.saleItems, db.inventoryMovements, db.utangEntries], async () => {
+    await db.transaction('rw', [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.utangEntries], async () => {
       await db.sales.add({
         id: saleId,
         storeId: context.storeId,
@@ -121,12 +139,22 @@ export async function completeSale(input: CompleteSaleInput) {
         updatedAt: now,
       });
 
+      const runningBase = new Map<string, number>();
       for (let index = 0; index < input.cart.length; index += 1) {
         const { quantity, subtotal: lineSubtotal } = preparedLines[index];
         const product = currentProducts[index]!;
-        const stockAfter = normalizeQuantity(product.stockQuantity - quantity);
+        const unit = preparedLines[index].unit;
+        const baseQuantity = preparedLines[index].baseQuantity;
+        const stockAfterBase = unit
+          ? (runningBase.get(product.id) ?? product.stockBaseQuantity ?? product.stockQuantity) - baseQuantity!
+          : null;
+        runningBase.set(product.id, unit ? stockAfterBase! : runningBase.get(product.id) ?? product.stockBaseQuantity ?? product.stockQuantity);
+        const stockAfter = unit
+          ? normalizeQuantity(stockAfterBase! / legacyDisplayMultiplier(product))
+          : normalizeQuantity(product.stockQuantity - quantity);
         await db.products.update(product.id, {
           stockQuantity: stockAfter,
+          ...(unit ? { stockBaseQuantity: stockAfterBase as number } : {}),
           updatedAt: now,
           recordVersion: product.recordVersion + 1,
         });
@@ -137,9 +165,15 @@ export async function completeSale(input: CompleteSaleInput) {
           productId: product.id,
           productNameSnapshot: product.name,
           quantity,
-          unitPrice: product.sellingPrice,
-          costPriceSnapshot: product.costPrice,
+          unitPrice: unit?.sellingPrice ?? product.sellingPrice,
+          costPriceSnapshot: unit?.costPrice ?? product.costPrice,
           subtotal: lineSubtotal,
+          productUnitId: unit?.id ?? null,
+          inputQuantity: preparedLines[index].inputQuantity ?? quantity,
+          unitNameSnapshot: unit?.name ?? product.unit,
+          unitSymbolSnapshot: unit?.symbol ?? product.unit,
+          multiplierBaseUnitsSnapshot: unit?.multiplierBaseUnits ?? 1,
+          baseQuantity: baseQuantity ?? Math.round(quantity),
           recordVersion: 1,
           createdAt: now,
           updatedAt: now,
@@ -152,6 +186,14 @@ export async function completeSale(input: CompleteSaleInput) {
           reason: 'sale',
           quantityDelta: -quantity,
           stockAfter,
+          productUnitId: unit?.id ?? null,
+          inputMode: 'delta',
+          inputQuantity: preparedLines[index].inputQuantity ?? quantity,
+          inputUnitSnapshot: unit?.name ?? product.unit,
+          multiplierBaseUnitsSnapshot: unit?.multiplierBaseUnits ?? 1,
+          baseQuantityDelta: unit ? -baseQuantity! : -quantity,
+          stockAfterBase: unit ? stockAfterBase! : undefined,
+          actorDisplayNameSnapshot: context.session.user.displayName,
           note: transactionNumber,
           actorUserId: context.userId,
           deviceId: context.deviceId,
@@ -196,6 +238,12 @@ export async function saveProduct(input: {
   soldByWeight?: boolean;
   quantityStep?: number;
   image?: ProductImageInput | null;
+  units?: ProductUnitInput[];
+  stockBaseQuantity?: number;
+  lowStockBaseThreshold?: number;
+  defaultSaleUnitId?: string | null;
+  defaultRestockUnitId?: string | null;
+  displayUnitId?: string | null;
 }) {
   const context = await getStoreContext();
   const now = new Date().toISOString();
@@ -233,6 +281,15 @@ export async function saveProduct(input: {
     recordVersion: existing ? existing.recordVersion + 1 : 1,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
+    ...(input.units?.length ? {
+      baseUnit: input.units.find((unit) => unit.isBase)?.name ?? input.unit,
+      baseUnitId: input.units.find((unit) => unit.isBase)?.id ?? null,
+      stockBaseQuantity: input.stockBaseQuantity ?? input.stockQuantity,
+      lowStockBaseThreshold: input.lowStockBaseThreshold ?? input.lowStockThreshold,
+      defaultSaleUnitId: input.defaultSaleUnitId ?? input.units.find((unit) => unit.canSell)?.id ?? null,
+      defaultRestockUnitId: input.defaultRestockUnitId ?? input.units.find((unit) => unit.canRestock)?.id ?? null,
+      displayUnitId: input.displayUnitId ?? input.units.find((unit) => unit.canSell)?.id ?? null,
+    } : {}),
   };
 
   const command: StoreCommand = {
@@ -253,12 +310,29 @@ export async function saveProduct(input: {
       lowStockThreshold: product.lowStockThreshold,
       isQuickItem: product.isQuickItem,
       isActive: product.isActive,
+      baseUnit: product.baseUnit,
+      stockBaseQuantity: product.stockBaseQuantity,
+      lowStockBaseThreshold: product.lowStockBaseThreshold,
+      defaultSaleUnitId: product.defaultSaleUnitId,
+      defaultRestockUnitId: product.defaultRestockUnitId,
+      displayUnitId: product.displayUnitId,
+      units: input.units,
     },
   };
+  const unitRows: ProductUnit[] = (input.units ?? []).map((unit) => ({
+    ...unit,
+    id: unit.id ?? crypto.randomUUID(),
+    storeId: context.storeId,
+    productId: product.id,
+    recordVersion: 1,
+    createdAt: existing?.updatedAt ?? now,
+    updatedAt: now,
+  }));
 
   return applyLocalCommand(command, async () => {
-    await db.transaction('rw', [db.products, db.productImages, db.productImageQueue], async () => {
+    await db.transaction('rw', [db.products, db.productUnits, db.productImages, db.productImageQueue], async () => {
       await db.products.put(product);
+      if (unitRows.length) await db.productUnits.bulkPut(unitRows);
       if (input.image) {
         await db.productImages.put({
           productId: product.id,
@@ -375,6 +449,67 @@ export async function restockProduct(product: Product, mode: RestockMode, quanti
   });
 }
 
+export async function receiveStock(product: Product, unit: ProductUnit, inputQuantity: number, note = 'Stock received') {
+  if (!unit.canRestock) throw new Error(`${unit.name} cannot be used for receiving stock`);
+  const baseDelta = convertInputToBase(unit, inputQuantity);
+  const context = await getStoreContext();
+  const now = new Date().toISOString();
+  return applyLocalCommand({
+    type: 'receiveStock',
+    payload: { productId: product.id, productUnitId: unit.id, inputQuantity, note },
+  }, async () => {
+    const current = await db.products.get(product.id);
+    if (!current) throw new Error('Product not found');
+    const nextBase = (current.stockBaseQuantity ?? current.stockQuantity) + baseDelta;
+    await db.transaction('rw', [db.products, db.inventoryMovements], async () => {
+      await db.products.update(current.id, { stockBaseQuantity: nextBase, stockQuantity: normalizeQuantity(nextBase / legacyDisplayMultiplier(current)), updatedAt: now, recordVersion: current.recordVersion + 1 });
+      await db.inventoryMovements.add({
+        id: crypto.randomUUID(), storeId: context.storeId, productId: current.id, saleId: null, reason: 'restock',
+        quantityDelta: baseDelta, stockAfter: nextBase, note, actorUserId: context.userId, deviceId: context.deviceId,
+        productUnitId: unit.id, inputMode: 'delta', inputQuantity, inputUnitSnapshot: unit.name,
+        multiplierBaseUnitsSnapshot: unit.multiplierBaseUnits, baseQuantityDelta: baseDelta, stockAfterBase: nextBase,
+        actorDisplayNameSnapshot: context.session.user.displayName, recordVersion: 1, createdAt: now, updatedAt: now,
+      });
+    });
+  });
+}
+
+export async function countStock(product: Product, unit: ProductUnit, inputQuantity: number, reason: NonNullable<import('@gma/contracts').InventoryMovement['adjustmentReason']>, note = 'Physical stock count') {
+  if (!unit.canRestock) throw new Error(`${unit.name} cannot be used for stock counting`);
+  const countedBase = inputQuantity === 0 ? 0 : convertInputToBase(unit, inputQuantity);
+  const context = await getStoreContext();
+  const now = new Date().toISOString();
+  return applyLocalCommand({ type: 'countStock', payload: { productId: product.id, productUnitId: unit.id, inputQuantity, reason, note, expectedVersion: product.recordVersion } }, async () => {
+    const current = await db.products.get(product.id);
+    if (!current) throw new Error('Product not found');
+    const currentBase = current.stockBaseQuantity ?? current.stockQuantity;
+    const delta = countedBase - currentBase;
+    await db.transaction('rw', [db.products, db.inventoryMovements], async () => {
+      await db.products.update(current.id, { stockBaseQuantity: countedBase, stockQuantity: normalizeQuantity(countedBase / legacyDisplayMultiplier(current)), updatedAt: now, recordVersion: current.recordVersion + 1 });
+      await db.inventoryMovements.add({ id: crypto.randomUUID(), storeId: context.storeId, productId: current.id, saleId: null, reason: 'adjustment', quantityDelta: delta, stockAfter: countedBase, note, actorUserId: context.userId, deviceId: context.deviceId, productUnitId: unit.id, inputMode: 'absolute', inputQuantity, inputUnitSnapshot: unit.name, multiplierBaseUnitsSnapshot: unit.multiplierBaseUnits, baseQuantityDelta: delta, stockAfterBase: countedBase, adjustmentReason: reason, actorDisplayNameSnapshot: context.session.user.displayName, recordVersion: 1, createdAt: now, updatedAt: now });
+    });
+  });
+}
+
+export async function adjustStockDelta(product: Product, unit: ProductUnit, inputQuantity: number, reason: NonNullable<import('@gma/contracts').InventoryMovement['adjustmentReason']>, note = 'Inventory adjustment') {
+  if (!inputQuantity) throw new Error('Adjustment quantity cannot be zero');
+  const magnitude = convertInputToBase(unit, Math.abs(inputQuantity));
+  const baseDelta = Math.sign(inputQuantity) * magnitude;
+  const context = await getStoreContext();
+  const now = new Date().toISOString();
+  return applyLocalCommand({ type: 'adjustStockDelta', payload: { productId: product.id, productUnitId: unit.id, inputQuantity, reason, note } }, async () => {
+    const current = await db.products.get(product.id);
+    if (!current) throw new Error('Product not found');
+    const currentBase = current.stockBaseQuantity ?? current.stockQuantity;
+    const nextBase = currentBase + baseDelta;
+    if (nextBase < 0) throw new Error('Adjustment would make stock negative');
+    await db.transaction('rw', [db.products, db.inventoryMovements], async () => {
+      await db.products.update(current.id, { stockBaseQuantity: nextBase, stockQuantity: normalizeQuantity(nextBase / legacyDisplayMultiplier(current)), updatedAt: now, recordVersion: current.recordVersion + 1 });
+      await db.inventoryMovements.add({ id: crypto.randomUUID(), storeId: context.storeId, productId: current.id, saleId: null, reason: 'adjustment', quantityDelta: baseDelta, stockAfter: nextBase, note, actorUserId: context.userId, deviceId: context.deviceId, productUnitId: unit.id, inputMode: 'delta', inputQuantity: Math.abs(inputQuantity), inputUnitSnapshot: unit.name, multiplierBaseUnitsSnapshot: unit.multiplierBaseUnits, baseQuantityDelta: baseDelta, stockAfterBase: nextBase, adjustmentReason: reason, actorDisplayNameSnapshot: context.session.user.displayName, recordVersion: 1, createdAt: now, updatedAt: now });
+    });
+  });
+}
+
 export async function createCustomer(name: string) {
   const normalizedName = name.trim();
   if (!normalizedName) throw new Error('Enter a customer name');
@@ -459,7 +594,8 @@ function prepareCartLine(entry: CartEntry, product: Product) {
     if (enteredAmount > maximumAmount) {
       throw new Error(`Only ${product.stockQuantity} ${product.unit} of ${product.name} remain (up to ₱${(maximumAmount / 100).toFixed(2)})`);
     }
-    return { quantity: normalizeQuantity(enteredAmount / product.sellingPrice), subtotal: enteredAmount };
+    const quantity = normalizeQuantity(enteredAmount / product.sellingPrice);
+    return { quantity, inputQuantity: quantity, baseQuantity: undefined, unit: undefined, subtotal: enteredAmount };
   }
 
   const quantity = entry.quantity;
@@ -469,7 +605,37 @@ function prepareCartLine(entry: CartEntry, product: Product) {
     throw new Error(`${product.name} must be sold in increments of ${quantityStep} ${product.unit}`);
   }
   if (product.stockQuantity < quantity) throw new Error(`Only ${product.stockQuantity} ${product.unit} of ${product.name} remain`);
-  return { quantity, subtotal: Math.round(quantity * product.sellingPrice) };
+  return { quantity, inputQuantity: quantity, baseQuantity: undefined, unit: undefined, subtotal: Math.round(quantity * product.sellingPrice) };
+}
+
+function prepareCanonicalCartLine(entry: CartEntry, product: Product, unit: ProductUnit) {
+  if (!unit.canSell || unit.sellingPrice == null) throw new Error(`${product.name} cannot be sold using ${unit.name}`);
+  const pricingMode = entry.pricingMode ?? 'quantity';
+  if (pricingMode === 'amount') {
+    if (!unit.allowAmountPricing || unit.sellingPrice <= 0) throw new Error(`${unit.name} cannot be sold by amount`);
+    const enteredAmount = entry.enteredAmount ?? 0;
+    if (!Number.isInteger(enteredAmount) || enteredAmount <= 0) throw new Error('Enter a valid peso amount');
+    const increment = Math.round(unit.multiplierBaseUnits * unit.quantityStep);
+    const baseQuantity = Math.floor(((enteredAmount / unit.sellingPrice) * unit.multiplierBaseUnits) / increment + 0.5) * increment;
+    const available = product.stockBaseQuantity ?? product.stockQuantity;
+    if (baseQuantity <= 0) throw new Error('Peso amount is below the minimum sale increment');
+    if (baseQuantity > available) throw new Error(`Only ${available} base units of ${product.name} remain`);
+    const quantity = normalizeQuantity(baseQuantity / unit.multiplierBaseUnits);
+    return { quantity, inputQuantity: quantity, baseQuantity, unit, subtotal: enteredAmount };
+  }
+  const quantity = entry.quantity;
+  if (!Number.isFinite(quantity) || quantity <= 0 || !isStepAligned(quantity, unit.quantityStep)) {
+    throw new Error(`${product.name} must be sold in increments of ${unit.quantityStep} ${unit.name}`);
+  }
+  const baseQuantity = Math.round(quantity * unit.multiplierBaseUnits);
+  const available = product.stockBaseQuantity ?? product.stockQuantity;
+  if (baseQuantity > available) throw new Error(`Only ${available} base units of ${product.name} remain`);
+  return { quantity, inputQuantity: quantity, baseQuantity, unit, subtotal: Math.round(quantity * unit.sellingPrice) };
+}
+
+function legacyDisplayMultiplier(product: Product) {
+  const unit = product.unit.trim().toLowerCase();
+  return unit === 'kg' || unit === 'kilogram' || unit === 'liter' || unit === 'litre' ? 1000 : 1;
 }
 
 function calculateChange(total: number, cashReceived: number) {

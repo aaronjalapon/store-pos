@@ -69,12 +69,13 @@ export function StaffPanel({ onAccessDenied, disabled = false }: {
   return (
     <section className="settings-card">
       <div className="section-heading">
-        <div><p className="eyebrow">ACCESS CONTROL</p><h2>Staff</h2></div>
+        <div><p className="eyebrow">AUTHORIZATION</p><h2>Staff access</h2></div>
         <Users />
       </div>
       <form className="stack-form" onSubmit={(event) => {
         event.preventDefault();
-        const values = new FormData(event.currentTarget);
+        const form = event.currentTarget;
+        const values = new FormData(form);
         const role = values.get('role')!.toString() as 'admin' | 'cashier';
         void run(async () => {
           if (role === 'admin') {
@@ -92,7 +93,7 @@ export function StaffPanel({ onAccessDenied, disabled = false }: {
               pin: values.get('secret')!.toString(),
             });
           }
-          event.currentTarget.reset();
+          form.reset();
         }, `${role === 'admin' ? 'Admin' : 'Cashier'} created.`);
       }}>
         <label>Role<select name="role" defaultValue="cashier" disabled={disabled || accessDenied || busy}><option value="cashier">Cashier</option><option value="admin">Admin</option></select></label>

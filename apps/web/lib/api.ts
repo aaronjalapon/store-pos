@@ -17,9 +17,13 @@ import type {
   StoreCommandResponse,
   StoreSyncResponse,
   SuperadminCreateStoreRequest,
+  SuperadminResetStaffSecretRequest,
   SuperadminStaffInput,
+  SuperadminStaffStatusRequest,
+  SuperadminStoreDetailsResponse,
   SuperadminStoreListResponse,
   SuperadminStoreMutationResponse,
+  SuperadminStoreStatusRequest,
 } from '@gma/contracts';
 import {
   applyServerSync,
@@ -354,6 +358,31 @@ export async function createSuperadminStore(input: SuperadminCreateStoreRequest,
 export async function createSuperadminStoreStaff(storeId: string, input: SuperadminStaffInput, apiUrl = API_DEFAULT) {
   return apiAuthed<SuperadminStoreMutationResponse>(`/v1/superadmin/stores/${storeId}/staff`, {
     method: 'POST',
+    body: JSON.stringify(input),
+  }, apiUrl);
+}
+
+export async function getSuperadminStoreDetails(storeId: string, apiUrl = API_DEFAULT) {
+  return apiAuthed<SuperadminStoreDetailsResponse>(`/v1/superadmin/stores/${storeId}`, {}, apiUrl);
+}
+
+export async function updateSuperadminStoreStatus(storeId: string, input: SuperadminStoreStatusRequest, apiUrl = API_DEFAULT) {
+  return apiAuthed<SuperadminStoreDetailsResponse>(`/v1/superadmin/stores/${storeId}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  }, apiUrl);
+}
+
+export async function updateSuperadminStaffStatus(storeId: string, userId: string, input: SuperadminStaffStatusRequest, apiUrl = API_DEFAULT) {
+  return apiAuthed<SuperadminStoreDetailsResponse>(`/v1/superadmin/stores/${storeId}/staff/${userId}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  }, apiUrl);
+}
+
+export async function resetSuperadminStaffSecret(storeId: string, userId: string, input: SuperadminResetStaffSecretRequest, apiUrl = API_DEFAULT) {
+  return apiAuthed<SuperadminStoreDetailsResponse>(`/v1/superadmin/stores/${storeId}/staff/${userId}/reset-secret`, {
+    method: 'PATCH',
     body: JSON.stringify(input),
   }, apiUrl);
 }

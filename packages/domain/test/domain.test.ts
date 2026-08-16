@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { calculateChange, calculateSaleTotals, calculateUtangBalance } from '../src';
+import { baseIncrementForUnit, calculateChange, calculateSaleTotals, calculateUtangBalance, convertToBaseUnits, pesoToBaseUnits } from '../src';
 
 describe('POS calculations', () => {
   it('uses integer centavos for cart totals and change', () => {
@@ -34,5 +34,17 @@ describe('POS calculations', () => {
     expect(calculateSaleTotals([
       { productId: 'pork', quantity: 0.3125, unitPrice: 32000, costPrice: 25000, subtotalOverride: 10000 },
     ])).toEqual({ subtotal: 10000, discount: 0, total: 10000 });
+  });
+
+  it('converts package and weighted units into integer base units', () => {
+    expect(convertToBaseUnits({ multiplierBaseUnits: 24, quantityStep: 1 }, 2)).toBe(48);
+    expect(convertToBaseUnits({ multiplierBaseUnits: 1000, quantityStep: 0.01 }, 2.5)).toBe(2500);
+    expect(baseIncrementForUnit({ multiplierBaseUnits: 1000, quantityStep: 0.01 })).toBe(10);
+  });
+
+  it('rounds peso-entered weighted sales to the nearest allowed base increment', () => {
+    const unit = { multiplierBaseUnits: 1000, quantityStep: 0.01, sellingPrice: 5500 };
+    expect(pesoToBaseUnits(unit, 2750)).toBe(500);
+    expect(pesoToBaseUnits(unit, 28)).toBe(10);
   });
 });

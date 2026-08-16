@@ -7,6 +7,7 @@ import type {
   Expense,
   InventoryMovement,
   Product,
+  ProductUnit,
   Sale,
   SaleItem,
   StoreCommandRequest,
@@ -51,6 +52,7 @@ export interface ProductImageQueueItem {
 
 export class PosDatabase extends Dexie {
   products!: EntityTable<Product, 'id'>;
+  productUnits!: EntityTable<ProductUnit, 'id'>;
   sales!: EntityTable<Sale, 'id'>;
   saleItems!: EntityTable<SaleItem, 'id'>;
   inventoryMovements!: EntityTable<InventoryMovement, 'id'>;
@@ -96,6 +98,20 @@ export class PosDatabase extends Dexie {
         item.lastAttemptAt = item.lastAttemptAt ?? null;
         item.errorMessage = item.errorMessage ?? null;
       });
+    });
+    this.version(6).stores({
+      products: 'id, &barcode, name, category, isQuickItem, isActive, updatedAt, recordVersion, baseUnit',
+      productUnits: 'id, productId, barcode, isActive, canSell, canRestock, updatedAt',
+      sales: 'id, transactionNumber, createdAt, paymentMethod, customerId, cashierUserId',
+      saleItems: 'id, saleId, productId, productUnitId, createdAt',
+      inventoryMovements: 'id, productId, productUnitId, saleId, createdAt',
+      customers: 'id, name, isActive, updatedAt, recordVersion',
+      utangEntries: 'id, customerId, saleId, createdAt',
+      expenses: 'id, category, occurredAt, createdAt',
+      settings: 'key',
+      mutationQueue: 'id, status, createdAt',
+      productImages: 'productId, revision, syncStatus, updatedAt',
+      productImageQueue: 'id, operation, productId, revision',
     });
   }
 }
@@ -175,11 +191,12 @@ export async function clearSession() {
 export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: number, skipWhenQueued = false) {
   const replaced = await db.transaction(
     'rw',
-    [db.products, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.settings, db.mutationQueue],
+    [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.settings, db.mutationQueue],
     async () => {
       if (skipWhenQueued && await db.mutationQueue.count() > 0) return false;
       await Promise.all([
         db.products.clear(),
+        db.productUnits.clear(),
         db.sales.clear(),
         db.saleItems.clear(),
         db.inventoryMovements.clear(),
@@ -189,6 +206,7 @@ export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: numb
       ]);
       await Promise.all([
         snapshot.products.length ? db.products.bulkPut(snapshot.products) : Promise.resolve(),
+        snapshot.productUnits?.length ? db.productUnits.bulkPut(snapshot.productUnits) : Promise.resolve(),
         snapshot.sales.length ? db.sales.bulkPut(snapshot.sales) : Promise.resolve(),
         snapshot.saleItems.length ? db.saleItems.bulkPut(snapshot.saleItems) : Promise.resolve(),
         snapshot.inventoryMovements.length ? db.inventoryMovements.bulkPut(snapshot.inventoryMovements) : Promise.resolve(),
@@ -270,9 +288,10 @@ export async function signOutLocally() {
 }
 
 export async function removeLocalStoreData() {
-  await db.transaction('rw', [db.products, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.mutationQueue, db.productImages, db.productImageQueue], async () => {
+  await db.transaction('rw', [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.mutationQueue, db.productImages, db.productImageQueue], async () => {
     await Promise.all([
       db.products.clear(),
+      db.productUnits.clear(),
       db.sales.clear(),
       db.saleItems.clear(),
       db.inventoryMovements.clear(),

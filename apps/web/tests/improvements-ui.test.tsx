@@ -27,6 +27,10 @@ const superadminSession: AuthSession = {
   device: null,
   user: { id: 'super', displayName: 'Super Admin', email: 'super@example.com', staffCode: null, role: 'superadmin' },
 };
+const cashierSession: AuthSession = {
+  ...session,
+  user: { ...session.user, email: null, staffCode: 'CASH001', role: 'cashier' },
+};
 
 function customer(id: string, name: string, nickname: string | null, phoneNumber: string | null): Customer {
   return { ...baseRecord, id, name, nickname, phoneNumber, notes: null, isActive: true };
@@ -222,12 +226,50 @@ describe('Utang search and app modal improvements', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /Add staff/i }).hasAttribute('disabled')).toBe(true));
   });
 
+  it('lets managers add both admin and cashier accounts', async () => {
+    vi.spyOn(apiModule, 'listStaff').mockResolvedValue([]);
+    const createStaff = vi.spyOn(apiModule, 'createStaff').mockResolvedValue({
+      id: 'staff-1', displayName: 'New staff', email: 'staff@example.com', staffCode: null,
+      role: 'admin', isActive: true, createdAt: now, updatedAt: now,
+    });
+
+    render(<StaffPanel />);
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Role' }), { target: { value: 'admin' } });
+    fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'New admin' } });
+    fireEvent.change(screen.getByLabelText('Email (admin only)'), { target: { value: 'admin@example.com' } });
+    fireEvent.change(screen.getByLabelText('Password / PIN'), { target: { value: 'ChangeMe123!' } });
+    fireEvent.click(screen.getByRole('button', { name: /Add staff/i }));
+
+    await waitFor(() => expect(createStaff).toHaveBeenCalledWith({
+      role: 'admin', displayName: 'New admin', email: 'admin@example.com', password: 'ChangeMe123!',
+    }));
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Role' }), { target: { value: 'cashier' } });
+    fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'New cashier' } });
+    fireEvent.change(screen.getByLabelText('Staff code (cashier only)'), { target: { value: 'CASH002' } });
+    fireEvent.change(screen.getByLabelText('Password / PIN'), { target: { value: '1234' } });
+    fireEvent.click(screen.getByRole('button', { name: /Add staff/i }));
+
+    await waitFor(() => expect(createStaff).toHaveBeenCalledWith({
+      role: 'cashier', displayName: 'New cashier', staffCode: 'CASH002', pin: '1234',
+    }));
+  });
+
+  it('keeps cashier accounts in Account view without authorization controls', () => {
+    render(<MoreView expenses={[]} session={cashierSession} onLogout={vi.fn().mockResolvedValue(undefined)} />);
+
+    expect(screen.getByRole('heading', { name: 'Account' })).toBeTruthy();
+    expect(screen.queryByText('Staff access')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Add staff/i })).toBeNull();
+  });
+
   it('surfaces a shared manager warning when recording an expense is denied', async () => {
     vi.spyOn(backupModule, 'getBackupStatus').mockResolvedValue({ latestBackupAt: null, backupCount: 0 });
     vi.spyOn(apiModule, 'listStaff').mockResolvedValue([]);
     vi.spyOn(posModule, 'recordExpense').mockRejectedValue(new Error('You do not have access to this action'));
 
-    render(<MoreView expenses={[]} session={session} canManageStore onLogout={vi.fn().mockResolvedValue(undefined)} />);
+    render(<MoreView expenses={[]} session={session} onLogout={vi.fn().mockResolvedValue(undefined)} />);
 
     fireEvent.change(screen.getByLabelText('Description'), { target: { value: 'Plastic bags' } });
     fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '100.00' } });
@@ -240,11 +282,16 @@ describe('Utang search and app modal improvements', () => {
   });
 
   it('lets a superadmin create a store from the global console', async () => {
+    const storeSummary = { id: 'store-1', name: 'Branch 1', isActive: true, ownerCount: 1, adminCount: 0, cashierCount: 0, lastActivityAt: now, lastDeviceSeenAt: now, latestBackupAt: null, backupCount: 0, createdAt: now, updatedAt: now };
     vi.spyOn(apiModule, 'listSuperadminStores')
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ id: 'store-1', name: 'Branch 1', ownerCount: 1, adminCount: 0, cashierCount: 0, createdAt: now, updatedAt: now }]);
+      .mockResolvedValueOnce([storeSummary]);
+    vi.spyOn(apiModule, 'getSuperadminStoreDetails').mockResolvedValue({
+      store: storeSummary,
+      staff: [{ id: 'owner-1', displayName: 'Owner One', email: 'owner1@example.com', staffCode: null, role: 'owner', isActive: true, createdAt: now, updatedAt: now }],
+    });
     const createStore = vi.spyOn(apiModule, 'createSuperadminStore').mockResolvedValue({
-      store: { id: 'store-1', name: 'Branch 1', ownerCount: 1, adminCount: 0, cashierCount: 0, createdAt: now, updatedAt: now },
+      store: storeSummary,
       staff: { id: 'owner-1', displayName: 'Owner One', email: 'owner1@example.com', staffCode: null, role: 'owner', isActive: true, createdAt: now, updatedAt: now },
     });
 
@@ -264,6 +311,28 @@ describe('Utang search and app modal improvements', () => {
     }));
     expect(await screen.findByText('Store and owner created.')).toBeTruthy();
     expect((await screen.findAllByText('Branch 1')).length).toBeGreaterThan(0);
+  });
+
+  it('lets a superadmin inspect and suspend a store', async () => {
+    const activeStore = { id: 'store-2', name: 'Branch 2', isActive: true, ownerCount: 1, adminCount: 1, cashierCount: 2, lastActivityAt: now, lastDeviceSeenAt: now, latestBackupAt: now, backupCount: 1, createdAt: now, updatedAt: now };
+    const suspendedStore = { ...activeStore, isActive: false };
+    const staff = [
+      { id: 'owner-2', displayName: 'Owner Two', email: 'owner2@example.com', staffCode: null, role: 'owner' as const, isActive: true, createdAt: now, updatedAt: now },
+      { id: 'admin-2', displayName: 'Admin Two', email: 'admin2@example.com', staffCode: null, role: 'admin' as const, isActive: true, createdAt: now, updatedAt: now },
+    ];
+    vi.spyOn(apiModule, 'listSuperadminStores').mockResolvedValue([activeStore]);
+    vi.spyOn(apiModule, 'getSuperadminStoreDetails').mockResolvedValue({ store: activeStore, staff });
+    const update = vi.spyOn(apiModule, 'updateSuperadminStoreStatus').mockResolvedValue({ store: suspendedStore, staff });
+
+    render(<SuperadminConsole session={superadminSession} onLogout={vi.fn().mockResolvedValue(undefined)} />);
+
+    expect((await screen.findAllByText('Branch 2')).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect' }));
+    expect(await screen.findByRole('heading', { name: 'Branch 2' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Suspend store' }));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Suspend store' }).at(-1)!);
+
+    await waitFor(() => expect(update).toHaveBeenCalledWith('store-2', { isActive: false }));
   });
 });
 

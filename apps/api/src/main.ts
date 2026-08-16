@@ -40,7 +40,7 @@ async function bootstrap() {
   const config = app.get(ConfigService);
   app.enableCors({
     origin: config.get('CORS_ORIGIN', 'http://localhost:3000').split(','),
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
   app.setGlobalPrefix('v1', { exclude: ['health'] });
   await app.listen(Number(config.get<string>('PORT') ?? 4000), '0.0.0.0');

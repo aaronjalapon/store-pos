@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import {
   createStaffSchema,
+  managerRoles,
   resetStaffSecretSchema,
   type CreateStaffRequest,
   type ResetStaffSecretRequest,
@@ -25,14 +26,14 @@ import { SessionAuthGuard } from '../auth/session-auth.guard';
 
 @Controller('stores/:storeId/staff')
 @UseGuards(SessionAuthGuard, RolesGuard)
-@Roles('owner', 'admin')
+@Roles(...managerRoles)
 export class StaffController {
   constructor(private readonly auth: AuthService) {}
 
   @Get()
   list(@Req() request: FastifyRequest, @Param('storeId', new ParseUUIDPipe()) storeId: string) {
     this.assertStoreScope(request, storeId);
-    return this.auth.listStaff(storeId).then((staff) => ({ staff }));
+    return this.auth.listStaff(storeId, request.principal!).then((staff) => ({ staff }));
   }
 
   @Post()

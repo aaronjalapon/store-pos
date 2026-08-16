@@ -1,9 +1,18 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import type { SuperadminAuthSession, SuperadminStoreSummary } from '@gma/contracts';
-import { LogOut, Plus, ShieldCheck, Store, UserRoundPlus, Users } from 'lucide-react';
-import { createSuperadminStore, createSuperadminStoreStaff, listSuperadminStores } from '../lib/api';
+import { useCallback, useEffect, useState } from 'react';
+import type { StaffMember, SuperadminAuthSession, SuperadminStoreDetailsResponse, SuperadminStoreSummary } from '@gma/contracts';
+import { Activity, CheckCircle2, Cloud, KeyRound, LogOut, Plus, ShieldCheck, Store, UserRoundPlus, Users, XCircle } from 'lucide-react';
+import {
+  createSuperadminStore,
+  createSuperadminStoreStaff,
+  getSuperadminStoreDetails,
+  listSuperadminStores,
+  resetSuperadminStaffSecret,
+  updateSuperadminStaffStatus,
+  updateSuperadminStoreStatus,
+} from '../lib/api';
+import { ConfirmModal } from './app-modal';
 
 export function SuperadminConsole({ session, onLogout }: {
   session: SuperadminAuthSession;
@@ -11,30 +20,98 @@ export function SuperadminConsole({ session, onLogout }: {
 }) {
   const [stores, setStores] = useState<SuperadminStoreSummary[]>([]);
   const [selectedStoreId, setSelectedStoreId] = useState('');
+  const [details, setDetails] = useState<SuperadminStoreDetailsResponse | null>(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pendingStoreStatus, setPendingStoreStatus] = useState<boolean | null>(null);
+  const [pendingMember, setPendingMember] = useState<{ member: StaffMember; isActive: boolean } | null>(null);
+  const [resetMember, setResetMember] = useState<StaffMember | null>(null);
+  const [resetPassword, setResetPassword] = useState('');
 
   const selectedStore = stores.find((store) => store.id === selectedStoreId) ?? stores[0] ?? null;
 
-  const refresh = async () => {
+  const loadDetails = useCallback(async (storeId: string) => {
+    const nextDetails = await getSuperadminStoreDetails(storeId);
+    setDetails(nextDetails);
+  }, []);
+
+  const refresh = useCallback(async (preferredStoreId = '') => {
     const nextStores = await listSuperadminStores();
     setStores(nextStores);
-    setSelectedStoreId((current) => current || nextStores[0]?.id || '');
-  };
+    const nextStoreId = preferredStoreId || nextStores[0]?.id || '';
+    setSelectedStoreId(nextStoreId);
+    if (nextStoreId) await loadDetails(nextStoreId);
+    else setDetails(null);
+  }, [loadDetails]);
 
   useEffect(() => {
     void refresh().catch((error) => setMessage(error instanceof Error ? error.message : 'Could not load stores'));
-  }, []);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!selectedStoreId) return;
+    void loadDetails(selectedStoreId).catch((error) => setMessage(error instanceof Error ? error.message : 'Could not load store details'));
+  }, [loadDetails, selectedStoreId]);
 
   async function run(work: () => Promise<void>, success: string) {
     setBusy(true);
     setMessage('');
     try {
       await work();
-      await refresh();
+      await refresh(selectedStoreId);
       setMessage(success);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Something went wrong');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changeStoreStatus(isActive: boolean) {
+    if (!selectedStore) return;
+    setBusy(true);
+    try {
+      await updateSuperadminStoreStatus(selectedStore.id, { isActive });
+      await refresh(selectedStore.id);
+      setPendingStoreStatus(null);
+      setMessage(isActive ? 'Store reactivated.' : 'Store suspended.');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Could not update store status');
+      throw error;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changeMemberStatus(member: StaffMember, isActive: boolean) {
+    if (!selectedStore) return;
+    setBusy(true);
+    try {
+      await updateSuperadminStaffStatus(selectedStore.id, member.id, { isActive });
+      await refresh(selectedStore.id);
+      setPendingMember(null);
+      setMessage(isActive ? `${member.displayName} reactivated.` : `${member.displayName} suspended.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Could not update access status');
+      throw error;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitReset() {
+    if (!selectedStore || !resetMember) return;
+    if (resetPassword.length < 8) throw new Error('Password must be at least 8 characters');
+    setBusy(true);
+    try {
+      await resetSuperadminStaffSecret(selectedStore.id, resetMember.id, { password: resetPassword });
+      await refresh(selectedStore.id);
+      setResetMember(null);
+      setResetPassword('');
+      setMessage(`${resetMember.displayName}'s password was reset.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Could not reset password');
+      throw error;
     } finally {
       setBusy(false);
     }
@@ -51,7 +128,7 @@ export function SuperadminConsole({ session, onLogout }: {
       </header>
       <section className="page-panel">
         <div className="page-header">
-          <div><p className="eyebrow">GLOBAL ACCESS</p><h1>Stores</h1><p>Create stores and assign owner or admin access.</p></div>
+          <div><p className="eyebrow">GLOBAL OVERSIGHT</p><h1>Stores</h1><p>Monitor store access and health, then manage owner and admin lifecycle controls.</p></div>
         </div>
         {message && <p className="form-message">{message}</p>}
         <div className="more-grid">
@@ -112,13 +189,81 @@ export function SuperadminConsole({ session, onLogout }: {
           <div className="recent-expenses">
             {stores.length ? stores.map((store) => (
               <div key={store.id}>
-                <span>{store.name}<small>{store.ownerCount} owner · {store.adminCount} admin · {store.cashierCount} cashier</small></span>
-                <b>{new Date(store.createdAt).toLocaleDateString('en-PH')}</b>
+                <span><strong>{store.name}</strong><small>{store.isActive ? 'ACTIVE' : 'SUSPENDED'} · {store.ownerCount} owner · {store.adminCount} admin · {store.cashierCount} cashier</small></span>
+                <button type="button" className="secondary-button compact" disabled={busy} onClick={() => setSelectedStoreId(store.id)}>Inspect</button>
               </div>
             )) : <p className="muted">No stores yet.</p>}
           </div>
         </section>
+
+        {selectedStore && details && <StoreDetails
+          details={details}
+          busy={busy}
+          onStoreStatus={() => setPendingStoreStatus(!details.store.isActive)}
+          onMemberStatus={(member) => setPendingMember({ member, isActive: !member.isActive })}
+          onReset={(member) => { setResetMember(member); setResetPassword(''); }}
+        />}
       </section>
+
+      {pendingStoreStatus !== null && selectedStore && <ConfirmModal
+        title={pendingStoreStatus ? 'Reactivate store?' : 'Suspend store?'}
+        description={pendingStoreStatus ? 'Store users will be able to sign in and sync again.' : 'This blocks new logins, sync, and store operations. Store data is preserved.'}
+        confirmLabel={pendingStoreStatus ? 'Reactivate store' : 'Suspend store'}
+        tone={pendingStoreStatus ? 'primary' : 'danger'}
+        onClose={() => setPendingStoreStatus(null)}
+        onConfirm={() => changeStoreStatus(pendingStoreStatus)}
+      />}
+      {pendingMember && <ConfirmModal
+        title={pendingMember.isActive ? 'Reactivate access?' : 'Suspend access?'}
+        description={`${pendingMember.member.displayName} will ${pendingMember.isActive ? 'be able' : 'no longer be able'} to sign in to this store.`}
+        confirmLabel={pendingMember.isActive ? 'Reactivate access' : 'Suspend access'}
+        tone={pendingMember.isActive ? 'primary' : 'danger'}
+        onClose={() => setPendingMember(null)}
+        onConfirm={() => changeMemberStatus(pendingMember.member, pendingMember.isActive)}
+      />}
+      {resetMember && <ConfirmModal
+        title={`Reset ${resetMember.displayName}'s password?`}
+        description="This replaces the current owner/admin password immediately."
+        confirmLabel="Reset password"
+        onClose={() => { setResetMember(null); setResetPassword(''); }}
+        onConfirm={submitReset}
+      >
+        <label>New password<input data-autofocus type="password" minLength={8} value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} /></label>
+      </ConfirmModal>}
     </main>
   );
+}
+
+function StoreDetails({ details, busy, onStoreStatus, onMemberStatus, onReset }: {
+  details: SuperadminStoreDetailsResponse;
+  busy: boolean;
+  onStoreStatus: () => void;
+  onMemberStatus: (member: StaffMember) => void;
+  onReset: (member: StaffMember) => void;
+}) {
+  const { store, staff } = details;
+  return <section className="settings-card">
+    <div className="section-heading">
+      <div><p className="eyebrow">STORE OVERSIGHT</p><h2>{store.name}</h2><p>{store.isActive ? 'Active store' : 'Suspended store'}</p></div>
+      {store.isActive ? <CheckCircle2 className="success-icon" /> : <XCircle />}
+    </div>
+    <div className="metric-grid">
+      <div className="metric-card blue"><div><Users size={16} /><span>Access</span></div><strong>{store.ownerCount + store.adminCount + store.cashierCount}</strong><small>{store.ownerCount} owners · {store.adminCount} admins · {store.cashierCount} cashiers</small></div>
+      <div className="metric-card green"><div><Activity size={16} /><span>Activity</span></div><strong>{formatTime(store.lastActivityAt)}</strong><small>Last store update</small></div>
+      <div className="metric-card yellow"><div><Cloud size={16} /><span>Devices</span></div><strong>{formatTime(store.lastDeviceSeenAt)}</strong><small>Last device seen</small></div>
+      <div className="metric-card red"><div><ShieldCheck size={16} /><span>Backups</span></div><strong>{store.backupCount}</strong><small>{store.latestBackupAt ? `Latest ${formatTime(store.latestBackupAt)}` : 'No backup yet'}</small></div>
+    </div>
+    <div className="button-row"><button type="button" className={store.isActive ? 'danger-button' : 'primary-button'} disabled={busy} onClick={onStoreStatus}>{store.isActive ? 'Suspend store' : 'Reactivate store'}</button></div>
+    <div className="recent-expenses">
+      <strong>Owners, admins, and cashiers</strong>
+      {staff.map((member) => <div key={member.id}>
+        <span>{member.displayName}<small>{member.role.toUpperCase()} · {member.email || member.staffCode || 'No login id'} · {member.isActive ? 'Active' : 'Suspended'}</small></span>
+        {member.role === 'owner' || member.role === 'admin' ? <div className="staff-actions"><button type="button" className="secondary-button compact" disabled={busy} onClick={() => onReset(member)}><KeyRound size={16} /> Reset password</button><button type="button" className={member.isActive ? 'danger-button compact' : 'secondary-button compact'} disabled={busy} onClick={() => onMemberStatus(member)}>{member.isActive ? 'Suspend' : 'Reactivate'}</button></div> : null}
+      </div>)}
+    </div>
+  </section>;
+}
+
+function formatTime(value: string | null) {
+  return value ? new Date(value).toLocaleDateString('en-PH', { month: 'short', day: 'numeric' }) : '—';
 }

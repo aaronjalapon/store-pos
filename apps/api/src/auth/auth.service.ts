@@ -1,11 +1,13 @@
 import {
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { isManagerRole } from '@gma/contracts';
 import type {
   AuthSession,
   CashierLoginRequest,
@@ -34,6 +36,7 @@ interface MembershipRow {
   pin_hash: string | null;
   user_active: boolean;
   membership_active: boolean;
+  store_active: boolean;
   role: StoreRole;
   store_id: string;
   store_name: string;
@@ -147,6 +150,7 @@ export class AuthService {
     if (!membership || !verifySecret(input.password, membership.password_hash)) {
       throw new UnauthorizedException('Invalid email or password');
     }
+    if (!membership.store_active) throw new UnauthorizedException('This store is suspended');
     if (!membership.user_active || !membership.membership_active) throw new UnauthorizedException('Your account is inactive');
     await this.database.transaction(async (client) => {
       await this.upsertDevice(client, {
@@ -172,6 +176,7 @@ export class AuthService {
     if (!membership || membership.role !== 'cashier' || !verifySecret(input.pin, membership.pin_hash)) {
       throw new UnauthorizedException('Invalid cashier code or PIN');
     }
+    if (!membership.store_active) throw new UnauthorizedException('This store is suspended');
     if (!membership.user_active || !membership.membership_active) throw new UnauthorizedException('This cashier account is inactive');
     await this.database.transaction(async (client) => {
       await this.upsertDevice(client, {
@@ -223,7 +228,7 @@ export class AuthService {
         throw new UnauthorizedException('Invalid or expired session token');
       }
       const membership = await this.findMembershipById(payload.sub, payload.storeId);
-      if (!membership || !membership.user_active || !membership.membership_active) {
+      if (!membership || !membership.store_active || !membership.user_active || !membership.membership_active) {
         throw new UnauthorizedException('Your session is no longer active');
       }
       const device = await this.database.query<DeviceRow>(
@@ -292,22 +297,117 @@ export class AuthService {
     const result = await this.database.query<{
       id: string;
       name: string;
+      is_active: boolean;
       owner_count: string;
       admin_count: string;
       cashier_count: string;
+      last_activity_at: Date | null;
+      last_device_seen_at: Date | null;
+      latest_backup_at: Date | null;
+      backup_count: string;
       created_at: Date;
       updated_at: Date;
     }>(
-      `SELECT stores.id, stores.name, stores.created_at, stores.updated_at,
-              COUNT(*) FILTER (WHERE store_memberships.role = 'owner' AND store_memberships.is_active) AS owner_count,
-              COUNT(*) FILTER (WHERE store_memberships.role = 'admin' AND store_memberships.is_active) AS admin_count,
-              COUNT(*) FILTER (WHERE store_memberships.role = 'cashier' AND store_memberships.is_active) AS cashier_count
+      `SELECT stores.id, stores.name, stores.is_active, stores.created_at, stores.updated_at,
+              (SELECT COUNT(*) FROM store_memberships sm JOIN users u ON u.id = sm.user_id WHERE sm.store_id = stores.id AND sm.role = 'owner' AND sm.is_active AND u.is_active) AS owner_count,
+              (SELECT COUNT(*) FROM store_memberships sm JOIN users u ON u.id = sm.user_id WHERE sm.store_id = stores.id AND sm.role = 'admin' AND sm.is_active AND u.is_active) AS admin_count,
+              (SELECT COUNT(*) FROM store_memberships sm JOIN users u ON u.id = sm.user_id WHERE sm.store_id = stores.id AND sm.role = 'cashier' AND sm.is_active AND u.is_active) AS cashier_count,
+              GREATEST(stores.updated_at, COALESCE((SELECT MAX(created_at) FROM sync_events WHERE store_id = stores.id), stores.updated_at)) AS last_activity_at,
+              (SELECT MAX(last_seen_at) FROM devices WHERE store_id = stores.id) AS last_device_seen_at,
+              (SELECT MAX(created_at) FROM backups WHERE store_id = stores.id AND backup_kind = 'server_snapshot') AS latest_backup_at,
+              (SELECT COUNT(*) FROM backups WHERE store_id = stores.id AND backup_kind = 'server_snapshot') AS backup_count
          FROM stores
-         LEFT JOIN store_memberships ON store_memberships.store_id = stores.id
-        GROUP BY stores.id
         ORDER BY stores.created_at DESC`,
     );
     return result.rows.map((row) => this.mapSuperadminStore(row));
+  }
+
+  async getSuperadminStoreDetails(storeId: string) {
+    return {
+      store: await this.getSuperadminStore(storeId),
+      staff: await this.listSuperadminStaff(storeId),
+    };
+  }
+
+  async setSuperadminStoreStatus(storeId: string, isActive: boolean) {
+    const result = await this.database.query<{ id: string }>(
+      'UPDATE stores SET is_active = $2, updated_at = now() WHERE id = $1 RETURNING id',
+      [storeId, isActive],
+    );
+    if (!result.rows[0]) throw new NotFoundException('Store not found');
+    return this.getSuperadminStoreDetails(storeId);
+  }
+
+  async setSuperadminStaffStatus(storeId: string, userId: string, isActive: boolean) {
+    await this.database.transaction(async (client) => {
+      const membership = await client.query<{ role: Role; is_active: boolean }>(
+        'SELECT role, is_active FROM store_memberships WHERE store_id = $1 AND user_id = $2',
+        [storeId, userId],
+      );
+      if (!membership.rows[0]) throw new NotFoundException('Staff account not found');
+      if (!['owner', 'admin'].includes(membership.rows[0].role)) {
+        throw new ConflictException('Superadmin lifecycle controls are limited to owners and admins');
+      }
+      if (!isActive && membership.rows[0].role === 'owner') {
+        const activeOwners = await client.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+             FROM store_memberships
+            WHERE store_id = $1 AND role = 'owner' AND is_active = true AND user_id <> $2`,
+          [storeId, userId],
+        );
+        if (Number(activeOwners.rows[0]?.count ?? 0) === 0) {
+          throw new ConflictException('The store must keep at least one active owner');
+        }
+      }
+      await client.query(
+        'UPDATE store_memberships SET is_active = $3, updated_at = now() WHERE store_id = $1 AND user_id = $2',
+        [storeId, userId, isActive],
+      );
+      if (isActive) {
+        await client.query('UPDATE users SET is_active = true, updated_at = now() WHERE id = $1', [userId]);
+      }
+      await client.query('UPDATE stores SET updated_at = now() WHERE id = $1', [storeId]);
+    });
+    return this.getSuperadminStoreDetails(storeId);
+  }
+
+  async resetSuperadminStaffSecret(storeId: string, userId: string, password: string) {
+    await this.database.transaction(async (client) => {
+      const membership = await client.query<{ role: Role }>(
+        'SELECT role FROM store_memberships WHERE store_id = $1 AND user_id = $2',
+        [storeId, userId],
+      );
+      if (!membership.rows[0]) throw new NotFoundException('Staff account not found');
+      if (!['owner', 'admin'].includes(membership.rows[0].role)) {
+        throw new ConflictException('Superadmin credential resets are limited to owners and admins');
+      }
+      await client.query('UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2', [hashSecret(password), userId]);
+      await client.query('UPDATE stores SET updated_at = now() WHERE id = $1', [storeId]);
+    });
+    return this.getSuperadminStoreDetails(storeId);
+  }
+
+  private async listSuperadminStaff(storeId: string): Promise<StaffMember[]> {
+    const result = await this.database.query<{
+      id: string;
+      display_name: string;
+      email: string | null;
+      staff_code: string | null;
+      role: Role;
+      is_active: boolean;
+      created_at: Date;
+      updated_at: Date;
+    }>(
+      `SELECT users.id, users.display_name, users.email, users.staff_code,
+              store_memberships.role, (users.is_active AND store_memberships.is_active) AS is_active,
+              users.created_at, users.updated_at
+         FROM users
+         JOIN store_memberships ON store_memberships.user_id = users.id
+        WHERE store_memberships.store_id = $1
+        ORDER BY CASE store_memberships.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, users.display_name ASC`,
+      [storeId],
+    );
+    return result.rows.map((row) => this.mapStaff(row));
   }
 
   async createStoreAsSuperadmin(input: SuperadminCreateStoreRequest) {
@@ -371,6 +471,7 @@ export class AuthService {
     staffCode?: string;
     pin?: string;
   }): Promise<StaffMember> {
+    this.requireManager(actor);
     const userId = await this.database.transaction(async (client) => {
       const userId = crypto.randomUUID();
       const now = new Date();
@@ -398,7 +499,8 @@ export class AuthService {
     return this.getStaffMember(storeId, userId);
   }
 
-  async listStaff(storeId: string) {
+  async listStaff(storeId: string, actor: SessionPrincipal) {
+    this.requireManager(actor);
     const result = await this.database.query<{
       id: string;
       display_name: string;
@@ -422,6 +524,7 @@ export class AuthService {
   }
 
   async disableStaff(storeId: string, actor: SessionPrincipal, userId: string) {
+    this.requireManager(actor);
     if (actor.userId === userId) throw new ConflictException('You cannot disable your own account');
     await this.database.transaction(async (client) => {
       const membership = await client.query<{ role: Role }>(
@@ -438,6 +541,7 @@ export class AuthService {
   }
 
   async resetStaffSecret(storeId: string, actor: SessionPrincipal, userId: string, input: { password?: string; pin?: string }) {
+    this.requireManager(actor);
     await this.database.transaction(async (client) => {
       const membership = await client.query<{ role: Role }>(
         'SELECT role FROM store_memberships WHERE store_id = $1 AND user_id = $2',
@@ -552,13 +656,13 @@ export class AuthService {
     const result = await this.database.query<MembershipRow>(
       `SELECT users.id AS user_id, users.display_name, users.email, users.staff_code,
               users.password_hash, users.pin_hash, users.is_active AS user_active,
-              store_memberships.is_active AS membership_active, store_memberships.role,
+              store_memberships.is_active AS membership_active, stores.is_active AS store_active, store_memberships.role,
               stores.id AS store_id, stores.name AS store_name, stores.created_at AS store_created_at, stores.updated_at AS store_updated_at
          FROM users
          JOIN store_memberships ON store_memberships.user_id = users.id
          JOIN stores ON stores.id = store_memberships.store_id
         WHERE LOWER(users.email) = LOWER($1)
-        ORDER BY CASE store_memberships.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, store_memberships.created_at ASC
+        ORDER BY stores.is_active DESC, CASE store_memberships.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, store_memberships.created_at ASC
         LIMIT 1`,
       [email],
     );
@@ -569,7 +673,7 @@ export class AuthService {
     const result = await this.database.query<MembershipRow>(
       `SELECT users.id AS user_id, users.display_name, users.email, users.staff_code,
               users.password_hash, users.pin_hash, users.is_active AS user_active,
-              store_memberships.is_active AS membership_active, store_memberships.role,
+              store_memberships.is_active AS membership_active, stores.is_active AS store_active, store_memberships.role,
               stores.id AS store_id, stores.name AS store_name, stores.created_at AS store_created_at, stores.updated_at AS store_updated_at
          FROM users
          JOIN store_memberships ON store_memberships.user_id = users.id
@@ -585,7 +689,7 @@ export class AuthService {
     const result = await this.database.query<MembershipRow>(
       `SELECT users.id AS user_id, users.display_name, users.email, users.staff_code,
               users.password_hash, users.pin_hash, users.is_active AS user_active,
-              store_memberships.is_active AS membership_active, store_memberships.role,
+              store_memberships.is_active AS membership_active, stores.is_active AS store_active, store_memberships.role,
               stores.id AS store_id, stores.name AS store_name, stores.created_at AS store_created_at, stores.updated_at AS store_updated_at
          FROM users
          JOIN store_memberships ON store_memberships.user_id = users.id
@@ -645,20 +749,27 @@ export class AuthService {
     const result = await this.database.query<{
       id: string;
       name: string;
+      is_active: boolean;
       owner_count: string;
       admin_count: string;
       cashier_count: string;
+      last_activity_at: Date | null;
+      last_device_seen_at: Date | null;
+      latest_backup_at: Date | null;
+      backup_count: string;
       created_at: Date;
       updated_at: Date;
     }>(
-      `SELECT stores.id, stores.name, stores.created_at, stores.updated_at,
-              COUNT(*) FILTER (WHERE store_memberships.role = 'owner' AND store_memberships.is_active) AS owner_count,
-              COUNT(*) FILTER (WHERE store_memberships.role = 'admin' AND store_memberships.is_active) AS admin_count,
-              COUNT(*) FILTER (WHERE store_memberships.role = 'cashier' AND store_memberships.is_active) AS cashier_count
+      `SELECT stores.id, stores.name, stores.is_active, stores.created_at, stores.updated_at,
+              (SELECT COUNT(*) FROM store_memberships sm JOIN users u ON u.id = sm.user_id WHERE sm.store_id = stores.id AND sm.role = 'owner' AND sm.is_active AND u.is_active) AS owner_count,
+              (SELECT COUNT(*) FROM store_memberships sm JOIN users u ON u.id = sm.user_id WHERE sm.store_id = stores.id AND sm.role = 'admin' AND sm.is_active AND u.is_active) AS admin_count,
+              (SELECT COUNT(*) FROM store_memberships sm JOIN users u ON u.id = sm.user_id WHERE sm.store_id = stores.id AND sm.role = 'cashier' AND sm.is_active AND u.is_active) AS cashier_count,
+              GREATEST(stores.updated_at, COALESCE((SELECT MAX(created_at) FROM sync_events WHERE store_id = stores.id), stores.updated_at)) AS last_activity_at,
+              (SELECT MAX(last_seen_at) FROM devices WHERE store_id = stores.id) AS last_device_seen_at,
+              (SELECT MAX(created_at) FROM backups WHERE store_id = stores.id AND backup_kind = 'server_snapshot') AS latest_backup_at,
+              (SELECT COUNT(*) FROM backups WHERE store_id = stores.id AND backup_kind = 'server_snapshot') AS backup_count
          FROM stores
-         LEFT JOIN store_memberships ON store_memberships.store_id = stores.id
         WHERE stores.id = $1
-        GROUP BY stores.id
         LIMIT 1`,
       [storeId],
     );
@@ -669,6 +780,10 @@ export class AuthService {
   private async touchStore(client: { query: DatabaseService['query'] }, storeId: string, _userId: string) {
     await client.query('UPDATE stores SET updated_at = now() WHERE id = $1', [storeId]);
     await client.query('INSERT INTO sync_events (store_id, kind) VALUES ($1, $2)', [storeId, 'staff']);
+  }
+
+  private requireManager(actor: SessionPrincipal) {
+    if (!isManagerRole(actor.role)) throw new ForbiddenException('You do not have access to this action');
   }
 
   private mapStore(row: { id: string; name: string; created_at: Date; updated_at: Date }): StoreInfo {
@@ -683,18 +798,28 @@ export class AuthService {
   private mapSuperadminStore(row: {
     id: string;
     name: string;
+    is_active: boolean;
     owner_count: string;
     admin_count: string;
     cashier_count: string;
+    last_activity_at: Date | null;
+    last_device_seen_at: Date | null;
+    latest_backup_at: Date | null;
+    backup_count: string;
     created_at: Date;
     updated_at: Date;
   }): SuperadminStoreSummary {
     return {
       id: row.id,
       name: row.name,
+      isActive: row.is_active,
       ownerCount: Number(row.owner_count),
       adminCount: Number(row.admin_count),
       cashierCount: Number(row.cashier_count),
+      lastActivityAt: row.last_activity_at?.toISOString() ?? null,
+      lastDeviceSeenAt: row.last_device_seen_at?.toISOString() ?? null,
+      latestBackupAt: row.latest_backup_at?.toISOString() ?? null,
+      backupCount: Number(row.backup_count),
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
     };

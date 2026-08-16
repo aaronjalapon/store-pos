@@ -145,6 +145,29 @@ describe('offline checkout transaction', () => {
       .rejects.toThrow('increments of 1 piece');
   });
 
+  it('keeps explicit bulk and remainder units on separate priced lines while sharing base stock', async () => {
+    const product = (await db.products.toArray())[0];
+    const baseId = '71551dba-4438-47b8-995c-8fe6153e3001';
+    const caseId = '71551dba-4438-47b8-995c-8fe6153e3002';
+    await db.products.update(product.id, { stockQuantity: 27, stockBaseQuantity: 27, defaultSaleUnitId: baseId });
+    await db.productUnits.bulkAdd([
+      { id: baseId, storeId: 'store', productId: product.id, name: 'bottle', symbol: 'btl', multiplierBaseUnits: 1, quantityStep: 1, canSell: true, canRestock: true, allowAmountPricing: false, sellingPrice: 1500, costPrice: 1000, barcode: null, isBase: true, isActive: true, replacesUnitId: null, recordVersion: 1, createdAt: now, updatedAt: now },
+      { id: caseId, storeId: 'store', productId: product.id, name: 'case', symbol: 'case', multiplierBaseUnits: 24, quantityStep: 1, canSell: true, canRestock: true, allowAmountPricing: false, sellingPrice: 34000, costPrice: 22000, barcode: null, isBase: false, isActive: true, replacesUnitId: null, recordVersion: 1, createdAt: now, updatedAt: now },
+    ]);
+    const current = (await db.products.get(product.id))!;
+    const units = await db.productUnits.toArray();
+    const bottle = units.find((unit) => unit.id === baseId)!;
+    const bulkCase = units.find((unit) => unit.id === caseId)!;
+    const result = await completeSale({
+      cart: [{ product: current, unit: bulkCase, quantity: 1 }, { product: current, unit: bottle, quantity: 3 }],
+      paymentMethod: 'cash', cashReceived: 40000, customerId: null,
+    });
+    expect(result.total).toBe(38500);
+    expect((await db.products.get(product.id))?.stockBaseQuantity).toBe(0);
+    expect((await db.saleItems.where('productId').equals(product.id).toArray()).map((item) => item.baseQuantity).sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([3, 24]);
+    expect((await db.inventoryMovements.where('productId').equals(product.id).toArray()).map((movement) => movement.baseQuantityDelta).sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([-24, -3]);
+  });
+
   it('stores product images separately and queues replacement cleanup', async () => {
     const firstImage = { revision: crypto.randomUUID(), blob: new Blob(['first'], { type: 'image/webp' }), contentType: 'image/webp' as const };
     const product = await saveProduct({

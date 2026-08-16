@@ -5,12 +5,16 @@ import {
   Get,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   UseGuards,
 } from '@nestjs/common';
 import {
   superadminCreateStoreSchema,
+  superadminResetStaffSecretSchema,
   superadminStaffInputSchema,
+  superadminStaffStatusSchema,
+  superadminStoreStatusSchema,
   type SuperadminCreateStoreRequest,
   type SuperadminStaffInput,
 } from '@gma/contracts';
@@ -45,5 +49,42 @@ export class SuperadminController {
     const result = superadminStaffInputSchema.safeParse(body);
     if (!result.success) throw new BadRequestException(result.error.flatten());
     return this.auth.createStoreStaffAsSuperadmin(storeId, result.data);
+  }
+
+  @Get('stores/:storeId')
+  details(@Param('storeId', new ParseUUIDPipe()) storeId: string) {
+    return this.auth.getSuperadminStoreDetails(storeId);
+  }
+
+  @Patch('stores/:storeId/status')
+  updateStoreStatus(
+    @Param('storeId', new ParseUUIDPipe()) storeId: string,
+    @Body() body: unknown,
+  ) {
+    const result = superadminStoreStatusSchema.safeParse(body);
+    if (!result.success) throw new BadRequestException(result.error.flatten());
+    return this.auth.setSuperadminStoreStatus(storeId, result.data.isActive);
+  }
+
+  @Patch('stores/:storeId/staff/:userId/status')
+  updateStaffStatus(
+    @Param('storeId', new ParseUUIDPipe()) storeId: string,
+    @Param('userId', new ParseUUIDPipe()) userId: string,
+    @Body() body: unknown,
+  ) {
+    const result = superadminStaffStatusSchema.safeParse(body);
+    if (!result.success) throw new BadRequestException(result.error.flatten());
+    return this.auth.setSuperadminStaffStatus(storeId, userId, result.data.isActive);
+  }
+
+  @Patch('stores/:storeId/staff/:userId/reset-secret')
+  resetStaffSecret(
+    @Param('storeId', new ParseUUIDPipe()) storeId: string,
+    @Param('userId', new ParseUUIDPipe()) userId: string,
+    @Body() body: unknown,
+  ) {
+    const result = superadminResetStaffSecretSchema.safeParse(body);
+    if (!result.success) throw new BadRequestException(result.error.flatten());
+    return this.auth.resetSuperadminStaffSecret(storeId, userId, result.data.password);
   }
 }

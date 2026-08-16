@@ -42,14 +42,38 @@ export class StoresService {
           `INSERT INTO products
            (id, store_id, barcode, sku, image_revision, name, category, cost_price, selling_price,
             stock_quantity, unit, sold_by_weight, quantity_step, low_stock_threshold, is_quick_item,
-            is_active, record_version, created_at, updated_at, created_by_user_id, updated_by_user_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $20)`,
+            is_active, record_version, created_at, updated_at, created_by_user_id, updated_by_user_id,
+            base_unit, stock_base_quantity, low_stock_base_threshold, default_sale_unit_id, default_restock_unit_id, display_unit_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $20,
+                   $21, $22, $23, $24, $25, $26)`,
           [
             product.id, principal.storeId, product.barcode, product.sku, product.imageRevision, product.name, product.category,
             product.costPrice, product.sellingPrice, product.stockQuantity, product.unit, product.soldByWeight, product.quantityStep,
             product.lowStockThreshold, product.isQuickItem, product.isActive, product.recordVersion, product.createdAt,
-            product.updatedAt, principal.userId,
+            product.updatedAt, principal.userId, product.baseUnit ?? product.unit, product.stockBaseQuantity ?? Math.round(product.stockQuantity),
+            product.lowStockBaseThreshold ?? Math.round(product.lowStockThreshold), null, null, null,
           ],
+        );
+      }
+      for (const unit of snapshot.productUnits ?? []) {
+        await client.query(
+          `INSERT INTO product_units
+           (id, store_id, product_id, name, symbol, multiplier_base_units, quantity_step, can_sell, can_restock,
+            allow_amount_pricing, selling_price, cost_price, barcode, is_base, is_active, replaces_unit_id,
+            record_version, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)`,
+          [unit.id, principal.storeId, unit.productId, unit.name, unit.symbol, unit.multiplierBaseUnits, unit.quantityStep,
+            unit.canSell, unit.canRestock, unit.allowAmountPricing, unit.sellingPrice, unit.costPrice, unit.barcode,
+            unit.isBase, unit.isActive, unit.replacesUnitId, unit.recordVersion, unit.createdAt],
+        );
+      }
+      for (const product of snapshot.products) {
+        if (!product.baseUnitId && !product.defaultSaleUnitId && !product.defaultRestockUnitId && !product.displayUnitId) continue;
+        await client.query(
+          `UPDATE products SET base_unit_id = $3, default_sale_unit_id = $4, default_restock_unit_id = $5, display_unit_id = $6
+           WHERE id = $1 AND store_id = $2`,
+          [product.id, principal.storeId, product.baseUnitId ?? null, product.defaultSaleUnitId ?? null,
+            product.defaultRestockUnitId ?? null, product.displayUnitId ?? null],
         );
       }
       for (const customer of snapshot.customers) {

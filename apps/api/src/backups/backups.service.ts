@@ -31,7 +31,7 @@ export class BackupsService {
        (id, store_id, device_id, schema_version, object_key, byte_length, checksum_sha256, created_at, backup_kind)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'server_snapshot')
        ON CONFLICT (id) DO NOTHING`,
-      [backupId, principal.storeId, principal.deviceId, 1, objectKey, body.byteLength, checksum, now],
+      [backupId, principal.storeId, principal.deviceId, 2, objectKey, body.byteLength, checksum, now],
     );
     return this.getSummary(principal.storeId);
   }

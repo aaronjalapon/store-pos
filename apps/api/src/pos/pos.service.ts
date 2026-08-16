@@ -30,6 +30,33 @@ interface ProductRow {
   record_version: number;
   created_at: Date;
   updated_at: Date;
+  base_unit: string | null;
+  base_unit_id: string | null;
+  stock_base_quantity: string | number | null;
+  low_stock_base_threshold: string | number | null;
+  default_sale_unit_id: string | null;
+  default_restock_unit_id: string | null;
+  display_unit_id: string | null;
+}
+
+interface ProductUnitRow {
+  id: string;
+  store_id: string;
+  product_id: string;
+  name: string;
+  symbol: string | null;
+  multiplier_base_units: string | number;
+  quantity_step: string | number;
+  can_sell: boolean;
+  can_restock: boolean;
+  allow_amount_pricing: boolean;
+  selling_price: number | null;
+  cost_price: number | null;
+  barcode: string | null;
+  is_base: boolean;
+  is_active: boolean;
+  replaces_unit_id: string | null;
+  record_version: number;
 }
 
 interface CustomerRow {
@@ -97,6 +124,18 @@ export class PosService {
             this.requireRole(principal, ['owner', 'admin']);
             commandResult = await this.restockProduct(client, principal, request.command.payload.productId, request.command.payload.mode, request.command.payload.quantity, request.command.payload.note, request.command.payload.expectedVersion);
             break;
+          case 'receiveStock':
+            this.requireRole(principal, ['owner', 'admin']);
+            commandResult = await this.receiveStock(client, principal, request.command.payload.productId, request.command.payload.productUnitId, request.command.payload.inputQuantity, request.command.payload.note);
+            break;
+          case 'countStock':
+            this.requireRole(principal, ['owner', 'admin']);
+            commandResult = await this.countStock(client, principal, request.command.payload);
+            break;
+          case 'adjustStockDelta':
+            this.requireRole(principal, ['owner', 'admin']);
+            commandResult = await this.adjustStockDelta(client, principal, request.command.payload);
+            break;
           case 'createCustomer':
             commandResult = await this.createCustomer(client, principal, request.command.payload.name);
             break;
@@ -137,6 +176,13 @@ export class PosService {
       ? await client.query<ProductRow>('SELECT * FROM products WHERE id = $1 AND store_id = $2', [payload.id, principal.storeId])
       : { rows: [] as ProductRow[] };
     const current = existing.rows[0];
+    const canonicalPayload = Boolean(payload.baseUnit || payload.units?.length || payload.stockBaseQuantity !== undefined);
+    const legacyMultiplier = this.legacyDisplayMultiplier({ unit: payload.unit } as ProductRow);
+    const canonicalValues = {
+      baseUnit: payload.baseUnit?.trim() || this.legacyBaseUnit(payload.unit),
+      stockBaseQuantity: payload.stockBaseQuantity ?? Math.round(payload.stockQuantity * legacyMultiplier),
+      lowStockBaseThreshold: payload.lowStockBaseThreshold ?? Math.round(payload.lowStockThreshold * legacyMultiplier),
+    };
     if (current && command.expectedVersion && current.record_version !== command.expectedVersion) {
       throw new StaleConflict('stale_product', `${current.name} was updated on another device. Refresh and try again.`);
     }
@@ -146,8 +192,8 @@ export class PosService {
     this.validateStockQuantity(payload.soldByWeight, payload.quantityStep, payload.stockQuantity, payload.unit);
     const barcodeOwner = payload.barcode
       ? await client.query<{ id: string }>(
-        'SELECT id FROM products WHERE store_id = $1 AND barcode = $2 AND id <> COALESCE($3, $4) LIMIT 1',
-        [principal.storeId, payload.barcode.trim(), payload.id ?? null, crypto.randomUUID()],
+        'SELECT id FROM products WHERE store_id = $1 AND barcode = $2 AND ($3::uuid IS NULL OR id <> $3::uuid) LIMIT 1',
+        [principal.storeId, payload.barcode.trim(), payload.id ?? null],
       )
       : { rows: [] as { id: string }[] };
     if (barcodeOwner.rows[0]) throw new ConflictException('That barcode is already assigned to another product');
@@ -161,7 +207,7 @@ export class PosService {
            category = $6,
            cost_price = $7,
            selling_price = $8,
-           stock_quantity = $9,
+           stock_quantity = CASE WHEN $18 THEN stock_quantity ELSE $9 END,
            unit = $10,
            sold_by_weight = $11,
            quantity_step = $12,
@@ -190,14 +236,16 @@ export class PosService {
           payload.isActive,
           now,
           principal.userId,
+          canonicalPayload,
         ],
       );
     } else {
       await client.query(
         `INSERT INTO products
          (id, store_id, barcode, sku, image_revision, name, category, cost_price, selling_price, stock_quantity, unit,
-          sold_by_weight, quantity_step, low_stock_threshold, is_quick_item, is_active, record_version, created_at, updated_at, created_by_user_id, updated_by_user_id)
-         VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 1, $16, $16, $17, $17)`,
+          sold_by_weight, quantity_step, low_stock_threshold, is_quick_item, is_active, record_version, created_at, updated_at, created_by_user_id, updated_by_user_id,
+          base_unit, stock_base_quantity, low_stock_base_threshold)
+         VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 1, $16, $16, $17, $17, $18, $19, $20)`,
         [
           id,
           principal.storeId,
@@ -216,8 +264,60 @@ export class PosService {
           payload.isActive,
           now,
           principal.userId,
+          canonicalValues.baseUnit,
+          canonicalValues.stockBaseQuantity,
+          canonicalValues.lowStockBaseThreshold,
         ],
       );
+    }
+    if (payload.baseUnit || payload.units?.length || payload.stockBaseQuantity !== undefined) {
+      await client.query(
+        `UPDATE products SET base_unit = $3, stock_base_quantity = $4, low_stock_base_threshold = $5,
+          base_unit_id = COALESCE($6, base_unit_id), default_sale_unit_id = COALESCE($7, default_sale_unit_id),
+          default_restock_unit_id = COALESCE($8, default_restock_unit_id), display_unit_id = COALESCE($9, display_unit_id)
+         WHERE id = $1 AND store_id = $2`,
+        [
+          id,
+          principal.storeId,
+          canonicalValues.baseUnit,
+          canonicalValues.stockBaseQuantity,
+          canonicalValues.lowStockBaseThreshold,
+          null,
+          null,
+          null,
+          null,
+        ],
+      );
+      for (const unit of payload.units ?? []) {
+        const unitId = unit.id ?? crypto.randomUUID();
+        await client.query(
+          `INSERT INTO product_units
+             (id, store_id, product_id, name, symbol, multiplier_base_units, quantity_step,
+              can_sell, can_restock, allow_amount_pricing, selling_price, cost_price, barcode,
+              is_base, is_active, replaces_unit_id, record_version, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 1, $17, $17)
+           ON CONFLICT (id) DO UPDATE SET
+             name = EXCLUDED.name, symbol = EXCLUDED.symbol, multiplier_base_units = EXCLUDED.multiplier_base_units,
+             quantity_step = EXCLUDED.quantity_step, can_sell = EXCLUDED.can_sell, can_restock = EXCLUDED.can_restock,
+             allow_amount_pricing = EXCLUDED.allow_amount_pricing, selling_price = EXCLUDED.selling_price,
+             cost_price = EXCLUDED.cost_price, barcode = EXCLUDED.barcode, is_base = EXCLUDED.is_base,
+             is_active = EXCLUDED.is_active, replaces_unit_id = EXCLUDED.replaces_unit_id,
+             record_version = product_units.record_version + 1, updated_at = EXCLUDED.updated_at`,
+          [unitId, principal.storeId, id, unit.name.trim(), unit.symbol?.trim() || null, unit.multiplierBaseUnits,
+            unit.quantityStep, unit.canSell, unit.canRestock, unit.allowAmountPricing, unit.sellingPrice ?? null,
+            unit.costPrice ?? null, unit.barcode?.trim() || null, unit.isBase, unit.isActive, unit.replacesUnitId ?? null, now],
+        );
+      }
+      const baseUnitId = payload.units?.find((unit) => unit.isBase)?.id;
+      if (baseUnitId) await client.query('UPDATE products SET base_unit_id = $3 WHERE id = $1 AND store_id = $2', [id, principal.storeId, baseUnitId]);
+      if (payload.defaultSaleUnitId || payload.defaultRestockUnitId || payload.displayUnitId) {
+        await client.query(
+          `UPDATE products SET default_sale_unit_id = COALESCE($3, default_sale_unit_id),
+             default_restock_unit_id = COALESCE($4, default_restock_unit_id), display_unit_id = COALESCE($5, display_unit_id)
+           WHERE id = $1 AND store_id = $2`,
+          [id, principal.storeId, payload.defaultSaleUnitId ?? null, payload.defaultRestockUnitId ?? null, payload.displayUnitId ?? null],
+        );
+      }
     }
     await this.data.createSyncEvent(client, principal.storeId, 'product');
     return { message: current ? 'Product updated.' : 'Product created.' };
@@ -233,12 +333,19 @@ export class PosService {
       [principal.storeId, command.payload.cart.map((line) => line.productId)],
     );
     const products = new Map(productsResult.rows.map((row) => [row.id, row]));
+    const unitIds = command.payload.cart.map((line) => line.productUnitId).filter((id): id is string => Boolean(id));
+    const unitsResult = unitIds.length
+      ? await client.query<ProductUnitRow>('SELECT * FROM product_units WHERE store_id = $1 AND id = ANY($2::uuid[])', [principal.storeId, unitIds])
+      : { rows: [] as ProductUnitRow[] };
+    const units = new Map(unitsResult.rows.map((row) => [row.id, row]));
     const preparedLines = command.payload.cart.map((line) => {
       const product = products.get(line.productId);
       if (!product || !product.is_active) {
         throw new StaleConflict('not_found', 'One of the products in this sale is no longer available.');
       }
-      return this.prepareSaleLine(product, line);
+      const unit = line.productUnitId ? units.get(line.productUnitId) : undefined;
+      if (line.productUnitId && !unit) throw new StaleConflict('not_found', 'One of the selected selling units is no longer available.');
+      return unit ? this.prepareCanonicalSaleLine(product, unit, line) : this.prepareSaleLine(product, line);
     });
     const subtotal = preparedLines.reduce((sum, line) => sum + line.subtotal, 0);
     const discount = 0;
@@ -263,29 +370,52 @@ export class PosService {
       ],
     );
 
+    const canonicalRunning = new Map<string, number>();
     for (const line of preparedLines) {
       const product = line.product;
-      const stockAfter = this.normalizeQuantity(product.stock_quantity - line.quantity);
+      const isCanonical = Boolean(line.unit);
+      const stockAfterBase = isCanonical
+        ? (canonicalRunning.get(product.id) ?? this.currentBaseStock(product)) - line.baseQuantity!
+        : null;
+      if (isCanonical && stockAfterBase! < 0) {
+        throw new StaleConflict('stale_product', `Only ${this.currentBaseStock(product)} base units of ${product.name} remain.`);
+      }
+      canonicalRunning.set(product.id, isCanonical ? stockAfterBase! : canonicalRunning.get(product.id) ?? this.currentBaseStock(product));
+      const stockAfter = isCanonical
+        ? this.normalizeQuantity(stockAfterBase! / this.legacyDisplayMultiplier(product))
+        : this.normalizeQuantity(product.stock_quantity - line.quantity);
       await client.query(
         `UPDATE products
             SET stock_quantity = $3,
+                stock_base_quantity = COALESCE($6, stock_base_quantity),
                 record_version = record_version + 1,
                 updated_at = $4,
                 updated_by_user_id = $5
           WHERE id = $1 AND store_id = $2`,
-        [product.id, principal.storeId, stockAfter, now, principal.userId],
+        [product.id, principal.storeId, stockAfter, now, principal.userId, stockAfterBase],
       );
       await client.query(
         `INSERT INTO sale_items
-         (id, store_id, sale_id, product_id, product_name_snapshot, quantity, unit_price, cost_price_snapshot, subtotal, record_version, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $10)`,
-        [crypto.randomUUID(), principal.storeId, saleId, product.id, product.name, line.quantity, product.selling_price, product.cost_price, line.subtotal, now],
+         (id, store_id, sale_id, product_id, product_name_snapshot, quantity, unit_price, cost_price_snapshot, subtotal, record_version, created_at, updated_at,
+          product_unit_id, input_quantity, unit_name_snapshot, unit_symbol_snapshot, multiplier_base_units_snapshot, base_quantity)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $10, $11, $12, $13, $14, $15, $16)`,
+        [crypto.randomUUID(), principal.storeId, saleId, product.id, product.name, line.quantity,
+          line.unit?.selling_price ?? product.selling_price, line.unit?.cost_price ?? product.cost_price,
+          line.subtotal, now, line.unit?.id ?? null, line.inputQuantity ?? line.quantity,
+          line.unit?.name ?? product.unit, line.unit?.symbol ?? product.unit,
+          line.unit?.multiplier_base_units ?? 1, line.baseQuantity ?? Math.round(line.quantity)],
       );
       await client.query(
         `INSERT INTO inventory_movements
-         (id, store_id, product_id, sale_id, reason, quantity_delta, stock_after, note, actor_user_id, device_id, record_version, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9, 1, $10, $10)`,
-        [crypto.randomUUID(), principal.storeId, product.id, saleId, -line.quantity, stockAfter, transactionNumber, principal.userId, principal.deviceId, now],
+         (id, store_id, product_id, sale_id, reason, quantity_delta, stock_after, note, actor_user_id, device_id, record_version, created_at, updated_at,
+          product_unit_id, input_mode, input_quantity, input_unit_snapshot, multiplier_base_units_snapshot, base_quantity_delta, stock_after_base, actor_display_name_snapshot)
+         VALUES ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9, 1, $10, $10, $11, 'delta', $12, $13, $14, $15, $16, $17)`,
+        [crypto.randomUUID(), principal.storeId, product.id, saleId,
+          isCanonical ? -line.baseQuantity! : -line.quantity, stockAfter, transactionNumber,
+          principal.userId, principal.deviceId, now, line.unit?.id ?? null,
+          line.inputQuantity ?? line.quantity, line.unit?.name ?? product.unit,
+          line.unit?.multiplier_base_units ?? 1, isCanonical ? -line.baseQuantity! : -line.quantity,
+          isCanonical ? stockAfterBase : null, principal.displayName],
       );
     }
 
@@ -357,6 +487,178 @@ export class PosService {
     return this.adjustStock(client, principal, productId, nextQuantity, note, expectedVersion);
   }
 
+  private async receiveStock(
+    client: { query: DatabaseService['query'] },
+    principal: SessionPrincipal,
+    productId: string,
+    productUnitId: string,
+    inputQuantity: number,
+    note: string,
+  ) {
+    const product = await this.requireProductForUpdate(client, principal.storeId, productId);
+    const unit = await this.requireProductUnit(client, principal.storeId, productId, productUnitId, true);
+    const baseDelta = this.convertInputToBase(unit, inputQuantity);
+    const nextBase = this.currentBaseStock(product) + baseDelta;
+    const now = new Date().toISOString();
+    await this.updateCanonicalStock(client, principal, product, nextBase, now);
+    await this.insertCanonicalMovement(client, principal, {
+      product, unit, reason: 'restock', inputMode: 'delta', inputQuantity,
+      baseQuantityDelta: baseDelta, stockAfterBase: nextBase, note: note || 'Stock received', now,
+    });
+    await this.data.createSyncEvent(client, principal.storeId, 'inventory');
+    return { message: 'Stock received.' };
+  }
+
+  private async countStock(
+    client: { query: DatabaseService['query'] },
+    principal: SessionPrincipal,
+    payload: Extract<StoreCommand, { type: 'countStock' }>['payload'],
+  ) {
+    const product = await this.requireProductForUpdate(client, principal.storeId, payload.productId);
+    if (product.record_version !== payload.expectedVersion) {
+      throw new StaleConflict('stale_product', `${product.name} changed on another device. Refresh before counting stock.`);
+    }
+    const unit = await this.requireProductUnit(client, principal.storeId, payload.productId, payload.productUnitId, true);
+    const countedBase = payload.inputQuantity === 0 ? 0 : this.convertInputToBase(unit, payload.inputQuantity);
+    const delta = countedBase - this.currentBaseStock(product);
+    const now = new Date().toISOString();
+    await this.updateCanonicalStock(client, principal, product, countedBase, now);
+    await this.insertCanonicalMovement(client, principal, {
+      product, unit, reason: 'adjustment', inputMode: 'absolute', inputQuantity: payload.inputQuantity,
+      baseQuantityDelta: delta, stockAfterBase: countedBase, adjustmentReason: payload.reason,
+      note: payload.note || 'Physical stock count', now,
+    });
+    await this.data.createSyncEvent(client, principal.storeId, 'inventory');
+    return { message: 'Physical stock count saved.' };
+  }
+
+  private async adjustStockDelta(
+    client: { query: DatabaseService['query'] },
+    principal: SessionPrincipal,
+    payload: Extract<StoreCommand, { type: 'adjustStockDelta' }>['payload'],
+  ) {
+    const product = await this.requireProductForUpdate(client, principal.storeId, payload.productId);
+    const unit = await this.requireProductUnit(client, principal.storeId, payload.productId, payload.productUnitId, true);
+    const baseDelta = this.convertInputToBase(unit, Math.abs(payload.inputQuantity)) * Math.sign(payload.inputQuantity);
+    const nextBase = this.currentBaseStock(product) + baseDelta;
+    if (nextBase < 0) throw new ConflictException(`Only ${this.currentBaseStock(product)} base units of ${product.name} remain.`);
+    const now = new Date().toISOString();
+    await this.updateCanonicalStock(client, principal, product, nextBase, now);
+    await this.insertCanonicalMovement(client, principal, {
+      product, unit, reason: 'adjustment', inputMode: 'delta', inputQuantity: Math.abs(payload.inputQuantity),
+      baseQuantityDelta: baseDelta, stockAfterBase: nextBase, adjustmentReason: payload.reason,
+      note: payload.note || 'Inventory adjustment', now,
+    });
+    await this.data.createSyncEvent(client, principal.storeId, 'inventory');
+    return { message: 'Inventory adjustment saved.' };
+  }
+
+  private async requireProductForUpdate(client: { query: DatabaseService['query'] }, storeId: string, productId: string) {
+    const result = await client.query<ProductRow>('SELECT * FROM products WHERE id = $1 AND store_id = $2 FOR UPDATE', [productId, storeId]);
+    if (!result.rows[0]) throw new StaleConflict('not_found', 'That product could not be found.');
+    return result.rows[0];
+  }
+
+  private async requireProductUnit(
+    client: { query: DatabaseService['query'] },
+    storeId: string,
+    productId: string,
+    unitId: string,
+    requireRestock: boolean,
+  ) {
+    const result = await client.query<ProductUnitRow>(
+      'SELECT * FROM product_units WHERE id = $1 AND store_id = $2 AND product_id = $3',
+      [unitId, storeId, productId],
+    );
+    const unit = result.rows[0];
+    if (!unit || (requireRestock && !unit.can_restock) || !unit.is_active) {
+      throw new ConflictException('The selected inventory unit is no longer available.');
+    }
+    return unit;
+  }
+
+  private currentBaseStock(product: ProductRow) {
+    return Number(product.stock_base_quantity ?? Math.round(product.stock_quantity));
+  }
+
+  private legacyDisplayMultiplier(product: ProductRow) {
+    const unit = product.unit.trim().toLowerCase();
+    return unit === 'kg' || unit === 'kilogram' || unit === 'liter' || unit === 'litre' ? 1000 : 1;
+  }
+
+  private legacyBaseUnit(unit: string) {
+    const normalized = unit.trim().toLowerCase();
+    if (normalized === 'kg' || normalized === 'kilogram') return 'g';
+    if (normalized === 'liter' || normalized === 'litre') return 'milliliter';
+    return unit.trim() || 'piece';
+  }
+
+  private convertInputToBase(unit: ProductUnitRow, inputQuantity: number) {
+    if (!Number.isFinite(inputQuantity) || inputQuantity <= 0) throw new ConflictException('Quantity must be above zero.');
+    const step = Number(unit.quantity_step);
+    const ratio = inputQuantity / step;
+    if (Math.abs(ratio - Math.round(ratio)) > 0.000001) {
+      throw new ConflictException(`Quantity must use increments of ${step} ${unit.name}.`);
+    }
+    const base = inputQuantity * Number(unit.multiplier_base_units);
+    if (!Number.isSafeInteger(Math.round(base))) throw new ConflictException('Quantity is too large.');
+    return Math.round(base);
+  }
+
+  private async updateCanonicalStock(
+    client: { query: DatabaseService['query'] },
+    principal: SessionPrincipal,
+    product: ProductRow,
+    nextBase: number,
+    now: string,
+  ) {
+    await client.query(
+      `UPDATE products
+          SET stock_base_quantity = $3,
+              stock_quantity = $6,
+              record_version = record_version + 1,
+              updated_at = $4,
+              updated_by_user_id = $5
+        WHERE id = $1 AND store_id = $2`,
+      [product.id, principal.storeId, nextBase, now, principal.userId, this.normalizeQuantity(nextBase / this.legacyDisplayMultiplier(product))],
+    );
+  }
+
+  private async insertCanonicalMovement(
+    client: { query: DatabaseService['query'] },
+    principal: SessionPrincipal,
+    input: {
+      product: ProductRow;
+      unit: ProductUnitRow;
+      reason: 'restock' | 'adjustment';
+      inputMode: 'delta' | 'absolute';
+      inputQuantity: number;
+      baseQuantityDelta: number;
+      stockAfterBase: number;
+      adjustmentReason?: string;
+      note: string;
+      now: string;
+    },
+  ) {
+    await client.query(
+      `INSERT INTO inventory_movements
+       (id, store_id, product_id, sale_id, reason, quantity_delta, stock_after, note,
+        actor_user_id, device_id, record_version, created_at, updated_at,
+        product_unit_id, input_mode, input_quantity, input_unit_snapshot,
+        multiplier_base_units_snapshot, base_quantity_delta, stock_after_base,
+        adjustment_reason, actor_display_name_snapshot)
+       VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, 1, $10, $10,
+               $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+      [
+        crypto.randomUUID(), principal.storeId, input.product.id, input.reason,
+        input.baseQuantityDelta, input.stockAfterBase, input.note, principal.userId,
+        principal.deviceId, input.now, input.unit.id, input.inputMode, input.inputQuantity,
+        input.unit.name, input.unit.multiplier_base_units, input.baseQuantityDelta,
+        input.stockAfterBase, input.adjustmentReason ?? null, principal.displayName,
+      ],
+    );
+  }
+
   private async createCustomer(client: { query: DatabaseService['query'] }, principal: SessionPrincipal, name: string) {
     const normalized = name.trim();
     if (!normalized) throw new ConflictException('Enter a customer name');
@@ -413,6 +715,44 @@ export class PosService {
     return result.rows[0];
   }
 
+  private prepareCanonicalSaleLine(
+    product: ProductRow,
+    unit: ProductUnitRow,
+    line: Extract<Extract<StoreCommand, { type: 'completeSale' }>['payload']['cart'][number], object>,
+  ) {
+    if (!unit.can_sell || unit.selling_price == null || unit.selling_price < 0) {
+      throw new ConflictException(`${product.name} cannot be sold using ${unit.name}`);
+    }
+    const pricingMode = line.pricingMode ?? 'quantity';
+    let inputQuantity = line.inputQuantity ?? line.quantity;
+    let baseQuantity: number;
+    let subtotal: number;
+    if (pricingMode === 'amount') {
+      if (!unit.allow_amount_pricing) throw new ConflictException(`${unit.name} cannot be sold by amount`);
+      const amount = line.enteredAmount ?? 0;
+      const increment = this.baseIncrement(unit);
+      const theoreticalBase = (amount / unit.selling_price) * Number(unit.multiplier_base_units);
+      baseQuantity = Math.floor(theoreticalBase / increment + 0.5) * increment;
+      if (!Number.isInteger(amount) || amount <= 0 || baseQuantity <= 0) throw new ConflictException('Peso amount is below the minimum sale increment');
+      inputQuantity = this.normalizeQuantity(baseQuantity / Number(unit.multiplier_base_units));
+      subtotal = amount;
+    } else {
+      baseQuantity = this.convertInputToBase(unit, inputQuantity);
+      subtotal = Math.round(inputQuantity * unit.selling_price);
+    }
+    if (baseQuantity > this.currentBaseStock(product)) {
+      throw new StaleConflict('stale_product', `Only ${this.currentBaseStock(product)} base units of ${product.name} remain.`);
+    }
+    return {
+      product,
+      unit,
+      quantity: inputQuantity,
+      inputQuantity,
+      baseQuantity,
+      subtotal,
+    };
+  }
+
   private prepareSaleLine(product: ProductRow, line: Extract<Extract<StoreCommand, { type: 'completeSale' }>['payload']['cart'][number], object>) {
     const pricingMode = line.pricingMode ?? 'quantity';
     if (pricingMode === 'amount') {
@@ -423,7 +763,8 @@ export class PosService {
       if (!Number.isInteger(enteredAmount) || enteredAmount <= 0 || enteredAmount > maximumAmount) {
         throw new ConflictException(`Only ${product.stock_quantity} ${product.unit} of ${product.name} remain`);
       }
-      return { product, quantity: this.normalizeQuantity(enteredAmount / product.selling_price), subtotal: enteredAmount };
+      const quantity = this.normalizeQuantity(enteredAmount / product.selling_price);
+      return { product, quantity, inputQuantity: quantity, baseQuantity: undefined, unit: undefined, subtotal: enteredAmount };
     }
     const quantity = line.quantity;
     if (!Number.isFinite(quantity) || quantity <= 0) throw new ConflictException(`Enter a valid quantity for ${product.name}`);
@@ -434,7 +775,15 @@ export class PosService {
     if (product.stock_quantity < quantity) {
       throw new StaleConflict('stale_product', `Only ${product.stock_quantity} ${product.unit} of ${product.name} remain.`);
     }
-    return { product, quantity, subtotal: Math.round(quantity * product.selling_price) };
+    return { product, quantity, inputQuantity: quantity, baseQuantity: undefined, unit: undefined, subtotal: Math.round(quantity * product.selling_price) };
+  }
+
+  private baseIncrement(unit: ProductUnitRow) {
+    const increment = Number(unit.multiplier_base_units) * Number(unit.quantity_step);
+    if (!Number.isSafeInteger(Math.round(increment)) || Math.abs(increment - Math.round(increment)) > 0.000001) {
+      throw new ConflictException(`Unit ${unit.name} is not aligned to base units`);
+    }
+    return Math.round(increment);
   }
 
   private validateStockQuantity(soldByWeight: boolean, quantityStep: number, quantity: number, unit: string) {
