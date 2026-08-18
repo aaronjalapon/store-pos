@@ -1,6 +1,9 @@
-# GMA Store POS
+# Store POS
 
 Mobile-first, offline-first sari-sari store POS built with Next.js, TypeScript, Dexie, NestJS, Fastify, and PostgreSQL.
+
+#Course:
+CCE106L Applications Development and Emerging Technologies
 
 ## Local development
 

@@ -13,7 +13,7 @@ import { db, removeLocalStoreData } from '../lib/db';
 import { centavosToPesoInput, pesoInputToCentavos } from '../lib/money';
 import {
   adjustStock, completeSale, createCustomer, recordExpense, recordUtangPayment, saveProduct, type CartEntry,
-  restockProduct, type ProductUnitInput,
+  receiveStock, restockProduct, type ProductUnitInput,
 } from '../lib/pos';
 import { getCachedConflictMessage, getSyncState, isManagerAccessDenied, requestSync, retryNeedsAttention, type SyncState } from '../lib/api';
 import { BackupPanel } from './backup-panel';
@@ -482,11 +482,24 @@ function LegacyInventoryView({ products, productUnits = [], inventoryMovements =
   const [editing, setEditing] = useState<Product | null>(null);
   const [adjusting, setAdjusting] = useState<Product | null>(null);
   const [scanner, setScanner] = useState(false);
-  const [restocking, setRestocking] = useState<Product | null>(null);
+  const [restocking, setRestocking] = useState<{ product: Product; initialUnitId: string | null } | null>(null);
   const [unknownBarcode, setUnknownBarcode] = useState<string | null>(null);
   const [inactiveBarcodeProduct, setInactiveBarcodeProduct] = useState<Product | null>(null);
   const [newProductBarcode, setNewProductBarcode] = useState<string | null>(null);
-  const barcodeSuggestions = useMemo(() => productBarcodeSuggestions(products, { includeInactive: true }), [products]);
+  const barcodeSuggestions = useMemo(() => {
+    const suggestions = new Map(productBarcodeSuggestions(products, { includeInactive: true }).map((suggestion) => [suggestion.code, suggestion]));
+    for (const unit of productUnits) {
+      if (!unit.barcode || !unit.isActive || !unit.canRestock || suggestions.has(unit.barcode)) continue;
+      const product = products.find((candidate) => candidate.id === unit.productId);
+      if (!product) continue;
+      suggestions.set(unit.barcode, {
+        code: unit.barcode,
+        label: `${product.name} · ${unit.name}`,
+        detail: `${formatQuantity(unit.multiplierBaseUnits)} ${product.baseUnit ?? product.unit}${product.isActive ? '' : ' · Inactive'}`,
+      });
+    }
+    return [...suggestions.values()];
+  }, [products, productUnits]);
   const formBarcodeSuggestions = useMemo(() => productBarcodeSuggestions(products), [products]);
   const filtered = products.filter((product) => product.name.toLowerCase().includes(query.toLowerCase()) || product.barcode?.includes(query));
   const lowStock = products.filter((product) => product.isActive && product.stockQuantity <= product.lowStockThreshold).length;
@@ -503,7 +516,10 @@ function LegacyInventoryView({ products, productUnits = [], inventoryMovements =
   const handleRestockBarcode = (code: string) => {
     const normalizedCode = code.trim();
     if (!normalizedCode) return;
-    const product = products.find((item) => item.barcode === normalizedCode);
+    const unit = productUnits.find((candidate) => candidate.barcode === normalizedCode && candidate.isActive && candidate.canRestock);
+    const product = unit
+      ? products.find((item) => item.id === unit.productId)
+      : products.find((item) => item.barcode === normalizedCode);
     setScanner(false);
     if (!product) {
       setUnknownBarcode(normalizedCode);
@@ -513,9 +529,9 @@ function LegacyInventoryView({ products, productUnits = [], inventoryMovements =
       setInactiveBarcodeProduct(product);
       return;
     }
-    setRestocking(product);
+    setRestocking({ product, initialUnitId: unit?.id ?? null });
   };
-  return <section className="page-panel"><div className="page-header"><div><p className="eyebrow">STOCK CONTROL</p><h1>Inventory</h1><p>{products.length} products · <span className={lowStock ? 'warning-text' : ''}>{lowStock} low stock</span></p></div><div className="page-actions"><button className="secondary-button" onClick={() => setScanner(true)}><Camera /> Quick Restock</button><button className="primary-button" onClick={() => openAddProduct()}><Plus /> Add product</button></div></div><label className="search-box standalone"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name or barcode…" /></label><div className="inventory-list">{filtered.map((product) => <article key={product.id} className="inventory-row"><ProductThumbnail product={product} /><div><strong>{product.name}</strong><small>{product.category} · {product.soldByWeight ? `Sold by weight · ${product.quantityStep} ${product.unit} step` : product.unit}{product.barcode ? ` · ${product.barcode}` : ''}</small></div><div className={product.stockQuantity <= product.lowStockThreshold ? 'stock-level low' : 'stock-level'}><strong>{formatQuantity(product.stockQuantity)}</strong><span>{product.unit} in stock</span></div><div className="inventory-price"><strong>{formatPeso(product.sellingPrice)}{product.soldByWeight ? `/${product.unit}` : ''}</strong><span>Cost {formatPeso(product.costPrice)}{product.soldByWeight ? `/${product.unit}` : ''}</span></div><button className="secondary-button compact" onClick={() => setAdjusting(product)}>Adjust</button><button className="icon-button" onClick={() => openEditProduct(product)} aria-label={`Edit ${product.name}`}><PackageOpen /></button></article>)}</div>{scanner && <CameraScanner onCode={handleRestockBarcode} onClose={() => setScanner(false)} suggestions={barcodeSuggestions} suggestionLabel="Inventory barcodes" />}{unknownBarcode && <ConfirmModal title="Barcode not found" description="No product is registered with this barcode. Would you like to add it now?" confirmLabel="Add product" onClose={() => setUnknownBarcode(null)} onConfirm={() => { const code = unknownBarcode; setUnknownBarcode(null); openAddProduct(code); }}><p className="barcode-confirmation"><span>BARCODE</span><strong>{unknownBarcode}</strong></p></ConfirmModal>}{inactiveBarcodeProduct && <ConfirmModal title="Product is inactive" description={`${inactiveBarcodeProduct.name} already uses barcode ${inactiveBarcodeProduct.barcode}. Edit or reactivate it before restocking.`} confirmLabel="Edit product" cancelLabel="Close" onClose={() => setInactiveBarcodeProduct(null)} onConfirm={() => { const product = inactiveBarcodeProduct; setInactiveBarcodeProduct(null); openEditProduct(product); }} />}{showForm && <ProductForm product={editing} productUnits={productUnits} initialBarcode={newProductBarcode ?? ''} barcodeSuggestions={editing ? productBarcodeSuggestions(products, { excludeProductId: editing.id }) : formBarcodeSuggestions} onClose={() => { setShowForm(false); setNewProductBarcode(null); }} />}{adjusting && <StockAdjustmentModal product={adjusting} onClose={() => setAdjusting(null)} onSave={(quantity) => adjustStock(adjusting, quantity, 'Manual stock adjustment')} />}{restocking && <QuickRestockModal product={restocking} onClose={() => setRestocking(null)} onSave={(mode, quantity) => restockProduct(restocking, mode, quantity)} />}</section>;
+  return <section className="page-panel"><div className="page-header"><div><p className="eyebrow">STOCK CONTROL</p><h1>Inventory</h1><p>{products.length} products · <span className={lowStock ? 'warning-text' : ''}>{lowStock} low stock</span></p></div><div className="page-actions"><button className="secondary-button" onClick={() => setScanner(true)}><Camera /> Quick Restock</button><button className="primary-button" onClick={() => openAddProduct()}><Plus /> Add product</button></div></div><label className="search-box standalone"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name or barcode…" /></label><div className="inventory-list">{filtered.map((product) => <article key={product.id} className="inventory-row"><ProductThumbnail product={product} /><div><strong>{product.name}</strong><small>{product.category} · {product.soldByWeight ? `Sold by weight · ${product.quantityStep} ${product.unit} step` : product.unit}{product.barcode ? ` · ${product.barcode}` : ''}</small></div><div className={product.stockQuantity <= product.lowStockThreshold ? 'stock-level low' : 'stock-level'}><strong>{formatQuantity(product.stockQuantity)}</strong><span>{product.unit} in stock</span></div><div className="inventory-price"><strong>{formatPeso(product.sellingPrice)}{product.soldByWeight ? `/${product.unit}` : ''}</strong><span>Cost {formatPeso(product.costPrice)}{product.soldByWeight ? `/${product.unit}` : ''}</span></div><div className="inventory-actions"><button className="primary-button compact" disabled={!product.isActive} onClick={() => setRestocking({ product, initialUnitId: null })} aria-label={`Restock ${product.name}`}><Plus /> Restock</button><button className="secondary-button compact" onClick={() => setAdjusting(product)}>Adjust</button></div><button className="icon-button" onClick={() => openEditProduct(product)} aria-label={`Edit ${product.name}`}><PackageOpen /></button></article>)}</div>{scanner && <CameraScanner onCode={handleRestockBarcode} onClose={() => setScanner(false)} suggestions={barcodeSuggestions} suggestionLabel="Inventory barcodes" />}{unknownBarcode && <ConfirmModal title="Barcode not found" description="No product is registered with this barcode. Would you like to add it now?" confirmLabel="Add product" onClose={() => setUnknownBarcode(null)} onConfirm={() => { const code = unknownBarcode; setUnknownBarcode(null); openAddProduct(code); }}><p className="barcode-confirmation"><span>BARCODE</span><strong>{unknownBarcode}</strong></p></ConfirmModal>}{inactiveBarcodeProduct && <ConfirmModal title="Product is inactive" description={`${inactiveBarcodeProduct.name} already uses barcode ${inactiveBarcodeProduct.barcode}. Edit or reactivate it before restocking.`} confirmLabel="Edit product" cancelLabel="Close" onClose={() => setInactiveBarcodeProduct(null)} onConfirm={() => { const product = inactiveBarcodeProduct; setInactiveBarcodeProduct(null); openEditProduct(product); }} />}{showForm && <ProductForm product={editing} productUnits={productUnits} initialBarcode={newProductBarcode ?? ''} barcodeSuggestions={editing ? productBarcodeSuggestions(products, { excludeProductId: editing.id }) : formBarcodeSuggestions} onClose={() => { setShowForm(false); setNewProductBarcode(null); }} />}{adjusting && <StockAdjustmentModal product={adjusting} onClose={() => setAdjusting(null)} onSave={(quantity) => adjustStock(adjusting, quantity, 'Manual stock adjustment')} />}{restocking && <QuickRestockModal product={restocking.product} units={productUnits} initialUnitId={restocking.initialUnitId} onClose={() => setRestocking(null)} onSave={(mode, quantity, unit) => mode === 'add' && unit ? receiveStock(restocking.product, unit, quantity) : restockProduct(restocking.product, mode, quantity)} />}</section>;
 }
 
 export function InventoryView(props: { products: Product[]; productUnits?: ProductUnit[]; inventoryMovements?: InventoryMovement[] }) {

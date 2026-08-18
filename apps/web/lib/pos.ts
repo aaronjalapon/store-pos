@@ -450,8 +450,9 @@ export async function restockProduct(product: Product, mode: RestockMode, quanti
 }
 
 export async function receiveStock(product: Product, unit: ProductUnit, inputQuantity: number, note = 'Stock received') {
-  if (!unit.canRestock) throw new Error(`${unit.name} cannot be used for receiving stock`);
-  const baseDelta = convertInputToBase(unit, inputQuantity);
+  if (!product.isActive) throw new Error(`${product.name} is inactive and cannot be restocked`);
+  if (unit.productId !== product.id || !unit.isActive || !unit.canRestock) throw new Error(`${unit.name} cannot be used for receiving stock`);
+  convertInputToBase(unit, inputQuantity);
   const context = await getStoreContext();
   const now = new Date().toISOString();
   return applyLocalCommand({
@@ -460,14 +461,20 @@ export async function receiveStock(product: Product, unit: ProductUnit, inputQua
   }, async () => {
     const current = await db.products.get(product.id);
     if (!current) throw new Error('Product not found');
+    if (!current.isActive) throw new Error(`${current.name} is inactive and cannot be restocked`);
+    const currentUnit = await db.productUnits.get(unit.id);
+    if (!currentUnit || currentUnit.productId !== current.id || !currentUnit.isActive || !currentUnit.canRestock) {
+      throw new Error('The selected inventory unit is no longer available');
+    }
+    const baseDelta = convertInputToBase(currentUnit, inputQuantity);
     const nextBase = (current.stockBaseQuantity ?? current.stockQuantity) + baseDelta;
     await db.transaction('rw', [db.products, db.inventoryMovements], async () => {
       await db.products.update(current.id, { stockBaseQuantity: nextBase, stockQuantity: normalizeQuantity(nextBase / legacyDisplayMultiplier(current)), updatedAt: now, recordVersion: current.recordVersion + 1 });
       await db.inventoryMovements.add({
         id: crypto.randomUUID(), storeId: context.storeId, productId: current.id, saleId: null, reason: 'restock',
         quantityDelta: baseDelta, stockAfter: nextBase, note, actorUserId: context.userId, deviceId: context.deviceId,
-        productUnitId: unit.id, inputMode: 'delta', inputQuantity, inputUnitSnapshot: unit.name,
-        multiplierBaseUnitsSnapshot: unit.multiplierBaseUnits, baseQuantityDelta: baseDelta, stockAfterBase: nextBase,
+        productUnitId: currentUnit.id, inputMode: 'delta', inputQuantity, inputUnitSnapshot: currentUnit.name,
+        multiplierBaseUnitsSnapshot: currentUnit.multiplierBaseUnits, baseQuantityDelta: baseDelta, stockAfterBase: nextBase,
         actorDisplayNameSnapshot: context.session.user.displayName, recordVersion: 1, createdAt: now, updatedAt: now,
       });
     });

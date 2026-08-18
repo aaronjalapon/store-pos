@@ -496,6 +496,7 @@ export class PosService {
     note: string,
   ) {
     const product = await this.requireProductForUpdate(client, principal.storeId, productId);
+    if (!product.is_active) throw new ConflictException(`${product.name} is inactive and cannot be restocked.`);
     const unit = await this.requireProductUnit(client, principal.storeId, productId, productUnitId, true);
     const baseDelta = this.convertInputToBase(unit, inputQuantity);
     const nextBase = this.currentBaseStock(product) + baseDelta;

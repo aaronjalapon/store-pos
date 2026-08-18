@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { db, saveSession } from '../lib/db';
-import { completeSale, restockProduct, saveProduct } from '../lib/pos';
+import { completeSale, receiveStock, restockProduct, saveProduct } from '../lib/pos';
 
 const now = new Date().toISOString();
 
@@ -75,6 +75,44 @@ describe('offline checkout transaction', () => {
     const movement = await db.inventoryMovements.where('productId').equals(product.id).first();
     expect((await db.products.get(product.id))?.stockQuantity).toBe(12);
     expect(movement).toMatchObject({ reason: 'restock', quantityDelta: 7, stockAfter: 12 });
+  });
+
+  it('receives a bulk quantity into shared base stock with unit snapshots', async () => {
+    const product = (await db.products.toArray())[0];
+    const caseUnit = {
+      id: '71551dba-4438-47b8-995c-8fe6153e3088', storeId: 'store', productId: product.id,
+      name: 'case', symbol: 'case', multiplierBaseUnits: 24, quantityStep: 1,
+      canSell: true, canRestock: true, allowAmountPricing: false, sellingPrice: 20000,
+      costPrice: 15000, barcode: 'CASE-24', isBase: false, isActive: true, replacesUnitId: null,
+      createdAt: now, updatedAt: now, recordVersion: 1,
+    };
+    await db.products.update(product.id, { stockQuantity: 5, stockBaseQuantity: 5, baseUnit: 'piece' });
+    await db.productUnits.add(caseUnit);
+
+    await receiveStock((await db.products.get(product.id))!, caseUnit, 2);
+
+    expect(await db.products.get(product.id)).toMatchObject({ stockQuantity: 53, stockBaseQuantity: 53 });
+    expect(await db.inventoryMovements.where('productId').equals(product.id).first()).toMatchObject({
+      reason: 'restock', quantityDelta: 48, stockAfter: 53, productUnitId: caseUnit.id,
+      inputQuantity: 2, inputUnitSnapshot: 'case', multiplierBaseUnitsSnapshot: 24,
+      baseQuantityDelta: 48, stockAfterBase: 53,
+    });
+  });
+
+  it('rejects inactive or unavailable restock units without queuing stock changes', async () => {
+    const product = (await db.products.toArray())[0];
+    const unavailableUnit = {
+      id: '71551dba-4438-47b8-995c-8fe6153e3089', storeId: 'store', productId: product.id,
+      name: 'case', symbol: 'case', multiplierBaseUnits: 24, quantityStep: 1,
+      canSell: true, canRestock: true, allowAmountPricing: false, sellingPrice: 20000,
+      costPrice: 15000, barcode: null, isBase: false, isActive: true, replacesUnitId: null,
+      createdAt: now, updatedAt: now, recordVersion: 1,
+    };
+
+    await expect(receiveStock(product, unavailableUnit, 1)).rejects.toThrow('no longer available');
+    expect((await db.products.get(product.id))?.stockQuantity).toBe(3);
+    expect(await db.inventoryMovements.count()).toBe(0);
+    expect(await db.mutationQueue.count()).toBe(0);
   });
 
   it('charges and deducts a fractional weighted quantity', async () => {

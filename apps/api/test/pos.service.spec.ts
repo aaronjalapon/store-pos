@@ -200,3 +200,56 @@ describe('PosService product persistence', () => {
     expect(data.createSyncEvent).not.toHaveBeenCalled();
   });
 });
+
+describe('PosService canonical inventory receiving', () => {
+  it('converts bulk input to base stock and persists the selected unit snapshot', async () => {
+    const productId = '00000000-0000-4000-8000-000000000041';
+    const unitId = '00000000-0000-4000-8000-000000000042';
+    const productRow = {
+      id: productId, store_id: ownerPrincipal.storeId, name: 'Bottled drink', unit: 'piece',
+      stock_quantity: 5, stock_base_quantity: 5, record_version: 1, is_active: true,
+    };
+    const unitRow = {
+      id: unitId, store_id: ownerPrincipal.storeId, product_id: productId, name: 'case', symbol: 'case',
+      multiplier_base_units: 24, quantity_step: 1, can_sell: true, can_restock: true,
+      allow_amount_pricing: false, selling_price: 20000, cost_price: 15000, barcode: 'CASE-24',
+      is_base: false, is_active: true, replaces_unit_id: null, record_version: 1,
+    };
+    const client = {
+      query: jest.fn(async (sql: string, _params?: unknown[]) => {
+        if (sql.includes('INSERT INTO processed_commands')) return { rows: [{ client_command_id: 'receive-command' }] };
+        if (sql.includes('SELECT * FROM products')) return { rows: [productRow] };
+        if (sql.includes('SELECT * FROM product_units')) return { rows: [unitRow] };
+        return { rows: [] };
+      }),
+    };
+    const database = {
+      query: jest.fn().mockResolvedValue({ rows: [{ first_synced_at: new Date() }] }),
+      transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
+    };
+    const data = {
+      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      currentCursor: jest.fn().mockResolvedValue(17),
+      createSyncEvent: jest.fn().mockResolvedValue(undefined),
+    };
+    const service = new PosService(database as never, data as never);
+    const request = {
+      clientCommandId: '00000000-0000-4000-8000-000000000043', baseCursor: 0,
+      command: {
+        type: 'receiveStock',
+        payload: { productId, productUnitId: unitId, inputQuantity: 2, note: 'Stock received' },
+      },
+    } satisfies StoreCommandRequest;
+
+    await expect(service.applyCommand(ownerPrincipal, request)).resolves.toMatchObject({
+      status: 'applied', cursor: 17, message: 'Stock received.',
+    });
+    const stockUpdate = client.query.mock.calls.find(([sql]) => String(sql).includes('SET stock_base_quantity'));
+    expect(stockUpdate?.[1]).toEqual([productId, ownerPrincipal.storeId, 53, expect.any(String), ownerPrincipal.userId, 53]);
+    const movementInsert = client.query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO inventory_movements'));
+    expect(movementInsert?.[1]).toEqual(expect.arrayContaining([
+      ownerPrincipal.storeId, productId, 'restock', 48, 53, unitId, 'delta', 2, 'case', 24,
+    ]));
+    expect(data.createSyncEvent).toHaveBeenCalledWith(client, ownerPrincipal.storeId, 'inventory');
+  });
+});

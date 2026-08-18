@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import type { Customer, Product } from '@gma/contracts';
+import type { Customer, Product, ProductUnit } from '@gma/contracts';
 import { formatPeso } from '@gma/domain';
 import { centavosToPesoInput, pesoInputToCentavos } from '../lib/money';
 import type { RestockMode } from '../lib/pos';
@@ -26,21 +26,52 @@ export function StockAdjustmentModal({ product, onClose, onSave }: { product: Pr
   return <AppModal title={`Adjust ${product.name}`} description={`Currently ${product.stockQuantity} ${product.unit} in stock. ${help}`} onClose={busy ? () => undefined : onClose}><form className="modal-form" onSubmit={async (event) => { event.preventDefault(); if (!valid) { setError(product.soldByWeight ? `Enter zero or more using ${step} ${product.unit} increments` : 'Enter a whole stock quantity of zero or more'); return; } setBusy(true); setError(''); try { await onSave(parsed); onClose(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not adjust stock'); setBusy(false); } }}><label>New stock quantity<input data-autofocus value={quantity} onChange={(event) => setQuantity(event.target.value)} type="number" min="0" step={step} inputMode={product.soldByWeight ? 'decimal' : 'numeric'} required /></label><div className="stock-preview"><span>Change</span><strong className={delta < 0 ? 'negative' : ''}>{delta > 0 ? '+' : ''}{delta} {product.unit}</strong></div>{error && <p className="form-message error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !valid}>{busy ? 'Saving…' : 'Save quantity'}</button></div></form></AppModal>;
 }
 
-export function QuickRestockModal({ product, onClose, onSave }: { product: Product; onClose: () => void; onSave: (mode: RestockMode, quantity: number) => Promise<void> }) {
+function legacyDisplayMultiplier(product: Product) {
+  const normalized = product.unit.trim().toLowerCase();
+  return ['kg', 'kilogram', 'liter', 'litre'].includes(normalized) ? 1000 : 1;
+}
+
+export function QuickRestockModal({
+  product,
+  units = [],
+  initialUnitId = null,
+  onClose,
+  onSave,
+}: {
+  product: Product;
+  units?: ProductUnit[];
+  initialUnitId?: string | null;
+  onClose: () => void;
+  onSave: (mode: RestockMode, quantity: number, unit: ProductUnit | null) => Promise<void>;
+}) {
+  const restockUnits = units.filter((unit) => unit.productId === product.id && unit.isActive && unit.canRestock);
+  const initialUnit = restockUnits.find((unit) => unit.id === initialUnitId)
+    ?? restockUnits.find((unit) => unit.id === product.defaultRestockUnitId)
+    ?? restockUnits.find((unit) => unit.id === product.displayUnitId)
+    ?? restockUnits[0]
+    ?? null;
   const [mode, setMode] = useState<RestockMode>('add');
+  const [selectedUnitId, setSelectedUnitId] = useState(initialUnit?.id ?? '');
   const [quantity, setQuantity] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const selectedUnit = restockUnits.find((unit) => unit.id === selectedUnitId) ?? initialUnit;
   const parsed = Number(quantity);
-  const step = product.soldByWeight ? product.quantityStep : 1;
+  const step = mode === 'add' && selectedUnit ? selectedUnit.quantityStep : product.soldByWeight ? product.quantityStep : 1;
   const stepUnits = parsed / step;
   const hasQuantity = quantity.trim() !== '';
   const stepAligned = hasQuantity && Number.isFinite(parsed) && Math.abs(stepUnits - Math.round(stepUnits)) < 0.000001;
   const valid = hasQuantity && Number.isFinite(parsed) && stepAligned && (mode === 'add' ? parsed > 0 : parsed >= 0);
-  const resulting = valid ? (mode === 'add' ? product.stockQuantity + parsed : parsed) : product.stockQuantity;
+  const displayMultiplier = legacyDisplayMultiplier(product);
+  const currentBase = product.stockBaseQuantity ?? Math.round(product.stockQuantity * displayMultiplier);
+  const baseDelta = valid && mode === 'add' ? Math.round(parsed * (selectedUnit?.multiplierBaseUnits ?? displayMultiplier)) : 0;
+  const resulting = valid ? (mode === 'add' ? (currentBase + baseDelta) / displayMultiplier : parsed) : product.stockQuantity;
   const delta = valid ? resulting - product.stockQuantity : 0;
-  const help = product.soldByWeight ? `Use ${step} ${product.unit} increments.` : 'Use whole-number quantities.';
-  return <AppModal title={`Restock ${product.name}`} description={`Current stock: ${formatQuantity(product.stockQuantity)} ${product.unit}. ${help}`} onClose={busy ? () => undefined : onClose}><form className="modal-form" onSubmit={async (event) => { event.preventDefault(); if (!valid) { setError(mode === 'add' ? (product.soldByWeight ? `Enter more than zero using ${step} ${product.unit} increments` : 'Enter a whole quantity above zero') : (product.soldByWeight ? `Enter zero or more using ${step} ${product.unit} increments` : 'Enter a whole stock total of zero or more')); return; } setBusy(true); setError(''); try { await onSave(mode, parsed); onClose(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not restock product'); setBusy(false); } }}><div className="restock-product-summary"><span>BARCODE</span><strong>{product.barcode ?? 'No barcode'}</strong>{product.stockQuantity <= product.lowStockThreshold && <small>Low stock threshold: {formatQuantity(product.lowStockThreshold)} {product.unit}</small>}</div><div className="stock-mode-toggle" role="group" aria-label="Restock mode"><button type="button" className={mode === 'add' ? 'active' : ''} aria-pressed={mode === 'add'} onClick={() => { setMode('add'); setError(''); }}>Add stock</button><button type="button" className={mode === 'set' ? 'active' : ''} aria-pressed={mode === 'set'} onClick={() => { setMode('set'); setError(''); }}>Set total</button></div><label>{mode === 'add' ? `Incoming quantity (${product.unit})` : `Final stock (${product.unit})`}<input data-autofocus value={quantity} onChange={(event) => setQuantity(event.target.value)} type="number" min={mode === 'add' ? step : 0} step={step} inputMode={product.soldByWeight ? 'decimal' : 'numeric'} required /></label><div className="stock-preview"><span>Resulting stock</span><strong className={delta < 0 ? 'negative' : ''}>{formatQuantity(resulting)} {product.unit}</strong></div><div className="stock-preview compact-preview"><span>Change</span><strong className={delta < 0 ? 'negative' : ''}>{delta > 0 ? '+' : ''}{formatQuantity(delta)} {product.unit}</strong></div>{error && <p className="form-message error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !valid}>{busy ? 'Saving…' : 'Save restock'}</button></div></form></AppModal>;
+  const inputUnitName = mode === 'add' ? selectedUnit?.name ?? product.unit : product.unit;
+  const help = `Use ${step} ${inputUnitName} increments.`;
+  const baseUnitName = product.baseUnit ?? restockUnits.find((unit) => unit.isBase)?.name ?? product.unit;
+  const showConvertedBase = mode === 'add' && selectedUnit && selectedUnit.multiplierBaseUnits !== displayMultiplier;
+  return <AppModal title={`Restock ${product.name}`} description={`Current stock: ${formatQuantity(product.stockQuantity)} ${product.unit}. ${help}`} onClose={busy ? () => undefined : onClose}><form className="modal-form" onSubmit={async (event) => { event.preventDefault(); if (!valid) { setError(mode === 'add' ? `Enter more than zero using ${step} ${inputUnitName} increments` : `Enter zero or more using ${step} ${product.unit} increments`); return; } setBusy(true); setError(''); try { await onSave(mode, parsed, mode === 'add' ? selectedUnit : null); onClose(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not restock product'); setBusy(false); } }}><div className="restock-product-summary"><span>BARCODE</span><strong>{selectedUnit?.barcode ?? product.barcode ?? 'No barcode'}</strong>{product.stockQuantity <= product.lowStockThreshold && <small>Low stock threshold: {formatQuantity(product.lowStockThreshold)} {product.unit}</small>}</div><div className="stock-mode-toggle" role="group" aria-label="Restock mode"><button type="button" className={mode === 'add' ? 'active' : ''} aria-pressed={mode === 'add'} onClick={() => { setMode('add'); setError(''); }}>Add stock</button><button type="button" className={mode === 'set' ? 'active' : ''} aria-pressed={mode === 'set'} onClick={() => { setMode('set'); setError(''); }}>Set total</button></div>{mode === 'add' && restockUnits.length > 1 && <label>Restock unit<select value={selectedUnit?.id ?? ''} onChange={(event) => { setSelectedUnitId(event.target.value); setQuantity(''); setError(''); }}>{restockUnits.map((unit) => <option key={unit.id} value={unit.id}>{unit.name}{unit.multiplierBaseUnits > 1 ? ` — ${formatQuantity(unit.multiplierBaseUnits)} ${baseUnitName}` : ''}</option>)}</select></label>}<label>{mode === 'add' ? `Incoming quantity (${inputUnitName})` : `Final stock (${product.unit})`}<input data-autofocus value={quantity} onChange={(event) => setQuantity(event.target.value)} type="number" min={mode === 'add' ? step : 0} step={step} inputMode={step < 1 ? 'decimal' : 'numeric'} required /></label>{showConvertedBase && valid && <div className="stock-preview compact-preview"><span>Stock added</span><strong>+{formatQuantity(baseDelta)} {baseUnitName}</strong></div>}<div className="stock-preview"><span>Resulting stock</span><strong className={delta < 0 ? 'negative' : ''}>{formatQuantity(resulting)} {product.unit}</strong></div>{!showConvertedBase && <div className="stock-preview compact-preview"><span>Change</span><strong className={delta < 0 ? 'negative' : ''}>{delta > 0 ? '+' : ''}{formatQuantity(delta)} {product.unit}</strong></div>}{error && <p className="form-message error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !valid}>{busy ? 'Saving…' : 'Save restock'}</button></div></form></AppModal>;
 }
 
 export function AddCustomerModal({ initialName = '', onClose, onSave }: { initialName?: string; onClose: () => void; onSave: (name: string) => Promise<Customer> }) {

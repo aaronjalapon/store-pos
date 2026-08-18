@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import type { AuthSession, Customer, Product } from '@gma/contracts';
+import type { AuthSession, Customer, Product, ProductUnit } from '@gma/contracts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InventoryView, MoreView, ProductForm, SellView, UtangView } from '../components/pos-app';
 import { QuickRestockModal, RecordPaymentModal, StockAdjustmentModal } from '../components/pos-dialogs';
@@ -42,6 +42,16 @@ function product(overrides: Partial<Product> = {}): Product {
     name: 'Test product', category: 'Other', costPrice: 500, sellingPrice: 700,
     stockQuantity: 3, unit: 'piece', soldByWeight: false, quantityStep: 1,
     lowStockThreshold: 1, isQuickItem: true, isActive: true,
+    ...overrides,
+  };
+}
+
+function productUnit(productId: string, overrides: Partial<ProductUnit> = {}): ProductUnit {
+  return {
+    ...baseRecord, id: crypto.randomUUID(), productId, name: 'piece', symbol: 'pc',
+    multiplierBaseUnits: 1, quantityStep: 1, canSell: true, canRestock: true,
+    allowAmountPricing: false, sellingPrice: 700, costPrice: 500, barcode: null,
+    isBase: true, isActive: true, replacesUnitId: null,
     ...overrides,
   };
 }
@@ -157,6 +167,68 @@ describe('Utang search and app modal improvements', () => {
     await waitFor(async () => expect((await db.products.get(coke.id))?.stockQuantity).toBe(17));
   });
 
+  it('opens restock directly from an active inventory row and disables it for inactive products', () => {
+    const active = product({ name: 'Active drink' });
+    const inactive = product({ name: 'Archived drink', isActive: false });
+    render(<InventoryView products={[active, inactive]} />);
+
+    expect((screen.getByRole('button', { name: 'Restock Archived drink' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Restock Active drink' }));
+
+    expect(screen.getByRole('dialog', { name: 'Restock Active drink' })).toBeTruthy();
+    expect(screen.queryByRole('combobox', { name: 'Barcode' })).toBeNull();
+  });
+
+  it('defaults to a configured bulk unit and adds its converted base stock', async () => {
+    const item = product({ name: 'Bottled drink', stockQuantity: 5, stockBaseQuantity: 5, baseUnit: 'piece' });
+    const base = productUnit(item.id);
+    const bulk = productUnit(item.id, {
+      name: 'case', symbol: 'case', multiplierBaseUnits: 24, barcode: 'CASE-24', isBase: false,
+    });
+    item.defaultRestockUnitId = bulk.id;
+    item.displayUnitId = base.id;
+    item.baseUnitId = base.id;
+    await db.products.add(item);
+    await db.productUnits.bulkAdd([base, bulk]);
+
+    render(<InventoryView products={[item]} productUnits={[base, bulk]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Restock Bottled drink' }));
+
+    expect((screen.getByRole('combobox', { name: 'Restock unit' }) as HTMLSelectElement).value).toBe(bulk.id);
+    fireEvent.change(screen.getByLabelText('Incoming quantity (case)'), { target: { value: '0' } });
+    expect((screen.getByRole('button', { name: 'Save restock' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText('Incoming quantity (case)'), { target: { value: '1.5' } });
+    expect((screen.getByRole('button', { name: 'Save restock' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText('Incoming quantity (case)'), { target: { value: '2' } });
+    expect(screen.getByText('+48 piece')).toBeTruthy();
+    expect(screen.getByText('53 piece')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Save restock' }));
+
+    await waitFor(async () => expect((await db.products.get(item.id))?.stockBaseQuantity).toBe(53));
+    expect(await db.products.get(item.id)).toMatchObject({ stockQuantity: 53 });
+    expect(await db.inventoryMovements.where('productId').equals(item.id).first()).toMatchObject({
+      reason: 'restock', productUnitId: bulk.id, inputQuantity: 2, inputUnitSnapshot: 'case',
+      multiplierBaseUnitsSnapshot: 24, baseQuantityDelta: 48, stockAfterBase: 53,
+    });
+    expect((await db.mutationQueue.toArray())[0].request.command).toMatchObject({
+      type: 'receiveStock', payload: { productId: item.id, productUnitId: bulk.id, inputQuantity: 2 },
+    });
+  });
+
+  it('recognizes a bulk-unit barcode and preselects that restock unit', async () => {
+    const item = product({ name: 'Bottled drink', barcode: 'BOTTLE', stockBaseQuantity: 5, baseUnit: 'piece' });
+    const base = productUnit(item.id, { barcode: item.barcode });
+    const bulk = productUnit(item.id, { name: 'case', multiplierBaseUnits: 24, barcode: 'CASE-24', isBase: false });
+    item.defaultRestockUnitId = base.id;
+    render(<InventoryView products={[item]} productUnits={[base, bulk]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Quick Restock' }));
+    fireEvent.change(await screen.findByLabelText('Barcode'), { target: { value: bulk.barcode } });
+    fireEvent.click(screen.getByRole('button', { name: 'Use code' }));
+
+    expect((screen.getByRole('combobox', { name: 'Restock unit' }) as HTMLSelectElement).value).toBe(bulk.id);
+    expect(screen.getByLabelText('Incoming quantity (case)')).toBeTruthy();
+  });
+
   it('supports set-total mode and validates regular restock quantities', async () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<QuickRestockModal product={product({ stockQuantity: 5 })} onClose={vi.fn()} onSave={save} />);
@@ -167,7 +239,7 @@ describe('Utang search and app modal improvements', () => {
     fireEvent.change(screen.getByLabelText('Final stock (piece)'), { target: { value: '12' } });
     expect(screen.getByText('+7 piece')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Save restock' }));
-    await waitFor(() => expect(save).toHaveBeenCalledWith('set', 12));
+    await waitFor(() => expect(save).toHaveBeenCalledWith('set', 12, null));
   });
 
   it('accepts weighted quick restock increments', async () => {
@@ -176,7 +248,7 @@ describe('Utang search and app modal improvements', () => {
     fireEvent.change(screen.getByLabelText('Incoming quantity (kg)'), { target: { value: '0.75' } });
     expect(screen.getByText('+0.75 kg')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Save restock' }));
-    await waitFor(() => expect(save).toHaveBeenCalledWith('add', 0.75));
+    await waitFor(() => expect(save).toHaveBeenCalledWith('add', 0.75, null));
   });
 
   it('closes on Escape and restores focus to the trigger', async () => {
