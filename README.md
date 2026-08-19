@@ -2,7 +2,7 @@
 
 Mobile-first, offline-first sari-sari store POS built with Next.js, TypeScript, Dexie, NestJS, Fastify, and PostgreSQL.
 
-#Course:
+##Course:
 CCE106L Applications Development and Emerging Technologies
 
 ## Local development
