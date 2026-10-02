@@ -20,6 +20,10 @@ import { PosController } from './pos/pos.controller';
 import { PosService } from './pos/pos.service';
 import { resolveEnvPath } from './config/resolve-env-path';
 import { SuperadminController } from './superadmin/superadmin.controller';
+import { ActivityController } from './activity/activity.controller';
+import { ActivityService } from './activity/activity.service';
+import { PaymentSettingsController } from './payment-settings/payment-settings.controller';
+import { PaymentSettingsService } from './payment-settings/payment-settings.service';
 
 @Module({
   imports: [
@@ -37,6 +41,8 @@ import { SuperadminController } from './superadmin/superadmin.controller';
     BackupsController,
     ProductImagesController,
     SuperadminController,
+    ActivityController,
+    PaymentSettingsController,
     HealthController,
   ],
   providers: [
@@ -48,6 +54,8 @@ import { SuperadminController } from './superadmin/superadmin.controller';
     PosService,
     BackupsService,
     ProductImagesService,
+    ActivityService,
+    PaymentSettingsService,
     { provide: ObjectStorage, useClass: S3ObjectStorage },
   ],
 })

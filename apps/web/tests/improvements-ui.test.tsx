@@ -105,8 +105,9 @@ describe('Utang search and app modal improvements', () => {
     render(<StockAdjustmentModal product={product({ stockQuantity: 3 })} onClose={vi.fn()} onSave={save} />);
     fireEvent.change(screen.getByLabelText('New stock quantity'), { target: { value: '8' } });
     expect(screen.getByText('+5 piece')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Save quantity' }));
-    await waitFor(() => expect(save).toHaveBeenCalledWith(8));
+    fireEvent.change(screen.getByLabelText('Confirm your password'), { target: { value: 'owner-password' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Verify & save quantity' }));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(8, 'owner-password'));
   });
 
   it('searches and selects category and unit options in the Product form', () => {
@@ -148,8 +149,15 @@ describe('Utang search and app modal improvements', () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<StockAdjustmentModal product={product({ unit: 'kg', soldByWeight: true, quantityStep: 0.01, stockQuantity: 5 })} onClose={vi.fn()} onSave={save} />);
     fireEvent.change(screen.getByLabelText('New stock quantity'), { target: { value: '4.25' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save quantity' }));
-    await waitFor(() => expect(save).toHaveBeenCalledWith(4.25));
+    expect((screen.getByRole('button', { name: 'Verify & save quantity' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText('Confirm your password'), { target: { value: 'owner-password' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Verify & save quantity' }));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(4.25, 'owner-password'));
+  });
+
+  it('does not expose stock adjustment when manager access is unavailable', () => {
+    render(<InventoryView products={[product({ name: 'Cashier-visible item' })]} canAdjustStock={false} />);
+    expect(screen.queryByRole('button', { name: 'Adjust' })).toBeNull();
   });
 
   it('saves quick restock in add-stock mode after scanning a known barcode', async () => {
@@ -254,15 +262,17 @@ describe('Utang search and app modal improvements', () => {
   it('closes on Escape and restores focus to the trigger', async () => {
     function Harness() {
       const [open, setOpen] = useState(false);
-      return <><button onClick={() => setOpen(true)}>Open modal</button>{open && <AppModal title="Accessible dialog" onClose={() => setOpen(false)}><input data-autofocus aria-label="Focused field" /></AppModal>}</>;
+      return <><main data-app-root><button onClick={() => setOpen(true)}>Open modal</button></main>{open && <AppModal title="Accessible dialog" onClose={() => setOpen(false)}><input data-autofocus aria-label="Focused field" /></AppModal>}</>;
     }
     render(<Harness />);
     const trigger = screen.getByRole('button', { name: 'Open modal' });
     trigger.focus();
     fireEvent.click(trigger);
     await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Focused field')));
+    expect(document.querySelector('[data-app-root]')?.hasAttribute('inert')).toBe(true);
     fireEvent.keyDown(document, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(document.querySelector('[data-app-root]')?.hasAttribute('inert')).toBe(false);
     expect(document.activeElement).toBe(trigger);
   });
 
@@ -405,6 +415,37 @@ describe('Utang search and app modal improvements', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Suspend store' }).at(-1)!);
 
     await waitFor(() => expect(update).toHaveBeenCalledWith('store-2', { isActive: false }));
+  });
+});
+
+describe('phone sell and inventory actions', () => {
+  beforeEach(async () => { await db.delete(); await db.open(); await saveSession(session); });
+  afterEach(async () => { cleanup(); await db.delete(); });
+
+  it('keeps Scan centered as the only empty-cart action, then adds a labelled cart summary', () => {
+    const item = product({ name: 'Coffee sachet', stockQuantity: 8 });
+    render(<SellView products={[item]} customers={[]} allowProductCreation={false} />);
+
+    const actions = screen.getByLabelText('Sell actions');
+    expect(within(actions).getByRole('button', { name: 'Scan product barcode' })).toBeTruthy();
+    expect(within(actions).queryByRole('button', { name: /product in cart/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /Coffee sachet/ }));
+    expect(within(actions).getByRole('button', { name: /1 product in cart, ₱7\.00 total\. View cart/ })).toBeTruthy();
+  });
+
+  it('labels low stock, disables zero-stock quick items, and exposes Inventory scan to restock', () => {
+    const low = product({ id: 'low', name: 'Low item', stockQuantity: 1, lowStockThreshold: 2 });
+    const empty = product({ id: 'empty', name: 'Empty item', stockQuantity: 0, lowStockThreshold: 2 });
+    const { unmount } = render(<SellView products={[low, empty]} customers={[]} allowProductCreation={false} />);
+
+    expect(screen.getByRole('button', { name: /Low item.*Low stock/ })).toBeTruthy();
+    expect((screen.getByRole('button', { name: /Empty item.*Out of stock/ }) as HTMLButtonElement).disabled).toBe(true);
+
+    unmount();
+    render(<InventoryView products={[low, empty]} />);
+    expect(screen.getByRole('button', { name: 'Scan barcode to restock inventory' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Low stock 2' }).getAttribute('aria-pressed')).toBe('false');
   });
 });
 

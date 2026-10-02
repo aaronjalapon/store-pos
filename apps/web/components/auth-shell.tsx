@@ -157,8 +157,8 @@ export function AuthShell() {
 
         <div className="auth-tabs">
           {mode === 'setup' && <button className="active"><Store size={16} /> First store setup</button>}
-          {mode !== 'setup' && <button className={mode === 'owner' ? 'active' : ''} onClick={() => setMode('owner')}><ShieldCheck size={16} /> Owner / Admin / Superadmin</button>}
-          {knownStoreId && <button className={mode === 'cashier' ? 'active' : ''} onClick={() => setMode('cashier')}><Users size={16} /> Cashier</button>}
+          {mode !== 'setup' && <button className={mode === 'owner' ? 'active' : ''} aria-pressed={mode === 'owner'} onClick={() => setMode('owner')}><ShieldCheck size={16} /> Manager</button>}
+          {knownStoreId && <button className={mode === 'cashier' ? 'active' : ''} aria-pressed={mode === 'cashier'} onClick={() => setMode('cashier')}><Users size={16} /> Cashier</button>}
         </div>
 
         {mode === 'setup' && <form className="stack-form auth-form" onSubmit={(event) => {

@@ -12,7 +12,7 @@ import {
   Res,
   UseGuards,
 } from '@nestjs/common';
-import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { Request, Response } from 'express';
 import { SessionAuthGuard } from '../auth/session-auth.guard';
 import { ProductImagesService } from './product-images.service';
 
@@ -23,7 +23,7 @@ export class ProductImagesController {
 
   @Put(':revision')
   put(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Param('productId', new ParseUUIDPipe()) productId: string,
     @Param('revision', new ParseUUIDPipe()) revision: string,
@@ -36,22 +36,22 @@ export class ProductImagesController {
 
   @Get(':revision')
   async get(
-    @Req() request: FastifyRequest,
-    @Res({ passthrough: true }) reply: FastifyReply,
+    @Req() request: Request,
+    @Res({ passthrough: true }) reply: Response,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Param('productId', new ParseUUIDPipe()) productId: string,
     @Param('revision', new ParseUUIDPipe()) revision: string,
   ) {
     this.assertStoreScope(request, storeId);
     const object = await this.images.get(request.principal!, productId, revision);
-    reply.header('content-type', object.contentType);
-    reply.header('cache-control', 'private, max-age=31536000, immutable');
+    reply.setHeader('content-type', object.contentType);
+    reply.setHeader('cache-control', 'private, max-age=31536000, immutable');
     return Buffer.from(object.body);
   }
 
   @Delete(':revision')
   delete(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Param('productId', new ParseUUIDPipe()) productId: string,
     @Param('revision', new ParseUUIDPipe()) revision: string,
@@ -60,7 +60,7 @@ export class ProductImagesController {
     return this.images.delete(request.principal!, productId, revision);
   }
 
-  private assertStoreScope(request: FastifyRequest, storeId: string) {
+  private assertStoreScope(request: Request, storeId: string) {
     if (request.principal?.storeId !== storeId) throw new ForbiddenException('You do not have access to this store');
   }
 }

@@ -10,8 +10,10 @@ export interface SessionPrincipal {
   staffCode: string | null;
 }
 
-declare module 'fastify' {
-  interface FastifyRequest {
-    principal?: SessionPrincipal;
+declare global {
+  namespace Express {
+    interface Request {
+      principal?: SessionPrincipal;
+    }
   }
 }

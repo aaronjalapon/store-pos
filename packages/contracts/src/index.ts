@@ -10,8 +10,15 @@ export function isManagerRole(role: Role): role is ManagerRole {
   return managerRoles.includes(role as ManagerRole);
 }
 
-export const paymentMethods = ['cash', 'gcash', 'maya', 'utang', 'other'] as const;
+export const paymentMethods = ['cash', 'qrph', 'gcash', 'maya', 'utang', 'other'] as const;
 export type PaymentMethod = (typeof paymentMethods)[number];
+
+export const qrPaymentConfirmationSources = ['merchant_notification', 'customer_proof'] as const;
+export type QrPaymentConfirmationSource = (typeof qrPaymentConfirmationSources)[number];
+export const qrPaymentStatuses = ['merchant_confirmed', 'pending_review', 'verified', 'rejected'] as const;
+export type QrPaymentStatus = (typeof qrPaymentStatuses)[number];
+export const qrPaymentAttentionReasons = ['customer_proof', 'duplicate_reference'] as const;
+export type QrPaymentAttentionReason = (typeof qrPaymentAttentionReasons)[number];
 
 export const inventoryMovementReasons = ['sale', 'restock', 'adjustment', 'void'] as const;
 export type InventoryMovementReason = (typeof inventoryMovementReasons)[number];
@@ -141,6 +148,31 @@ export interface Sale extends RecordBase {
   changeAmount: number | null;
 }
 
+export interface QrPayment extends RecordBase {
+  saleId: string;
+  cashierUserId: string;
+  cashierDisplayNameSnapshot: string;
+  deviceId: string;
+  amount: number;
+  reference: string;
+  normalizedReference: string;
+  confirmationSource: QrPaymentConfirmationSource;
+  status: QrPaymentStatus;
+  attentionReason: QrPaymentAttentionReason | null;
+  confirmedAt: string;
+  reviewedAt: string | null;
+  reviewedByUserId: string | null;
+  reviewNote: string | null;
+}
+
+export interface QrPhPaymentSettings {
+  storeId: string;
+  imageRevision: string;
+  contentType: 'image/png' | 'image/webp' | 'image/jpeg';
+  byteLength: number;
+  updatedAt: string;
+}
+
 export interface SaleItem extends RecordBase {
   saleId: string;
   productId: string;
@@ -221,6 +253,55 @@ export interface StaffMember {
   updatedAt: string;
 }
 
+export const activityCategories = [
+  'auth', 'sales', 'products', 'inventory', 'customers', 'utang', 'expenses',
+  'staff', 'backups', 'data', 'store',
+] as const;
+export type ActivityCategory = (typeof activityCategories)[number];
+export type ActivityStatus = 'confirmed' | 'pending' | 'needs_attention';
+
+export interface ActivityActor {
+  userId: string;
+  displayName: string;
+  role: Role;
+}
+
+export interface ActivityLog {
+  id: string;
+  storeId: string;
+  actor: ActivityActor;
+  submittedBy: ActivityActor | null;
+  deviceId: string | null;
+  deviceName: string | null;
+  category: ActivityCategory;
+  action: string;
+  entityType: string | null;
+  entityId: string | null;
+  summary: string;
+  details: Record<string, unknown>;
+  clientCommandId: string | null;
+  status: ActivityStatus;
+  occurredAt: string;
+  confirmedAt: string | null;
+  errorMessage?: string | null;
+}
+
+export interface ActivityLogListResponse {
+  activity: ActivityLog[];
+  nextCursor: string | null;
+}
+
+export interface ActivityLogFilters {
+  cursor?: string;
+  limit?: number;
+  category?: ActivityCategory;
+  actorUserId?: string;
+  role?: Role;
+  from?: string;
+  to?: string;
+  q?: string;
+}
+
 export interface SuperadminStoreSummary {
   id: string;
   name: string;
@@ -246,6 +327,8 @@ export interface StoreSnapshot {
   utangEntries: UtangEntry[];
   expenses: Expense[];
   staff: StaffMember[];
+  qrPayments?: QrPayment[];
+  paymentSettings?: QrPhPaymentSettings | null;
 }
 
 export interface StoreSyncResponse {
@@ -326,6 +409,11 @@ export interface SuperadminStoreMutationResponse {
   staff: StaffMember;
 }
 
+export interface SuperadminStoreDeleteResponse {
+  deleted: true;
+  storeId: string;
+}
+
 export const superadminStoreStatusSchema = z.object({
   isActive: z.boolean(),
 });
@@ -380,6 +468,17 @@ export const resetStaffSecretSchema = z.object({
 });
 export type ResetStaffSecretRequest = z.infer<typeof resetStaffSecretSchema>;
 
+export const managerActionConfirmationSchema = z.object({
+  action: z.literal('adjust_stock'),
+  clientCommandId: z.string().uuid(),
+  password: z.string().min(1).max(200),
+});
+export type ManagerActionConfirmationRequest = z.infer<typeof managerActionConfirmationSchema>;
+
+export interface ManagerActionConfirmationResponse {
+  proof: string;
+}
+
 const zIso = z.iso.datetime();
 
 export const saveProductCommandSchema = z.object({
@@ -425,6 +524,12 @@ export const saveProductCommandSchema = z.object({
   }),
 });
 
+const qrPaymentInputSchema = z.object({
+  id: z.string().uuid(),
+  reference: z.string().trim().min(1).max(80),
+  confirmationSource: z.enum(qrPaymentConfirmationSources),
+});
+
 export const completeSaleCommandSchema = z.object({
   type: z.literal('completeSale'),
   payload: z.object({
@@ -434,6 +539,7 @@ export const completeSaleCommandSchema = z.object({
     paymentMethod: z.enum(paymentMethods),
     cashReceived: z.number().int().min(0).nullable(),
     customerId: z.string().uuid().nullable(),
+    qrPayment: qrPaymentInputSchema.nullable().optional(),
     cart: z.array(z.object({
       productId: z.string().uuid(),
       quantity: z.number().positive(),
@@ -443,6 +549,27 @@ export const completeSaleCommandSchema = z.object({
       enteredAmount: z.number().int().positive().nullable().optional(),
       expectedVersion: z.number().int().positive(),
     })).min(1),
+  }).superRefine((payload, context) => {
+    if (payload.paymentMethod === 'qrph' && !payload.qrPayment) {
+      context.addIssue({ code: 'custom', path: ['qrPayment'], message: 'QR Ph payment details are required' });
+    }
+    if (payload.paymentMethod !== 'qrph' && payload.qrPayment) {
+      context.addIssue({ code: 'custom', path: ['qrPayment'], message: 'QR Ph payment details are only allowed for QR Ph sales' });
+    }
+  }),
+});
+
+export const reviewQrPaymentCommandSchema = z.object({
+  type: z.literal('reviewQrPayment'),
+  payload: z.object({
+    paymentId: z.string().uuid(),
+    decision: z.enum(['verify', 'reject']),
+    note: z.string().trim().max(200).default(''),
+    expectedVersion: z.number().int().positive(),
+  }).superRefine((payload, context) => {
+    if (payload.decision === 'reject' && !payload.note) {
+      context.addIssue({ code: 'custom', path: ['note'], message: 'A rejection note is required' });
+    }
   }),
 });
 
@@ -530,6 +657,7 @@ export const recordExpenseCommandSchema = z.object({
 export const storeCommandSchema = z.discriminatedUnion('type', [
   saveProductCommandSchema,
   completeSaleCommandSchema,
+  reviewQrPaymentCommandSchema,
   adjustStockCommandSchema,
   restockProductCommandSchema,
   receiveStockCommandSchema,
@@ -544,6 +672,9 @@ export type StoreCommand = z.infer<typeof storeCommandSchema>;
 export const storeCommandRequestSchema = z.object({
   clientCommandId: z.string().uuid(),
   baseCursor: z.number().int().nonnegative(),
+  occurredAt: zIso.optional(),
+  actorProof: z.string().min(1).optional(),
+  managerApprovalProof: z.string().min(1).optional(),
   command: storeCommandSchema,
 });
 export type StoreCommandRequest = z.infer<typeof storeCommandRequestSchema>;

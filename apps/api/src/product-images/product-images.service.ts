@@ -1,8 +1,9 @@
-import { BadRequestException, Injectable, PayloadTooLargeException } from '@nestjs/common';
+import { BadRequestException, Injectable, Optional, PayloadTooLargeException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { SessionPrincipal } from '../auth/auth.types';
 import { DatabaseService } from '../database/database.service';
 import { ObjectStorage } from '../storage/object-storage';
+import { ActivityService } from '../activity/activity.service';
 
 const ALLOWED_CONTENT_TYPES = new Set(['image/webp', 'image/jpeg']);
 
@@ -12,6 +13,7 @@ export class ProductImagesService {
     private readonly storage: ObjectStorage,
     private readonly config: ConfigService,
     private readonly database: DatabaseService,
+    @Optional() private readonly activity?: ActivityService,
   ) {}
 
   async put(principal: SessionPrincipal, productId: string, revision: string, body: Uint8Array, contentType: string) {
@@ -23,17 +25,31 @@ export class ProductImagesService {
     if (!this.hasValidSignature(body, normalizedType)) throw new BadRequestException('Product image content does not match its MIME type');
     const objectKey = this.objectKey(principal.storeId, productId, revision);
     await this.storage.put(objectKey, body, normalizedType);
-    await this.database.query(
-      `INSERT INTO product_images (store_id, product_id, revision, object_key, content_type, byte_length, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, now())
-       ON CONFLICT (store_id, product_id) DO UPDATE SET
-         revision = EXCLUDED.revision,
-         object_key = EXCLUDED.object_key,
-         content_type = EXCLUDED.content_type,
-         byte_length = EXCLUDED.byte_length,
-         updated_at = now()`,
-      [principal.storeId, productId, revision, objectKey, normalizedType, body.byteLength],
-    );
+    const persist = async (client: { query: DatabaseService['query'] }) => {
+      await client.query(
+        `INSERT INTO product_images (store_id, product_id, revision, object_key, content_type, byte_length, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now())
+         ON CONFLICT (store_id, product_id) DO UPDATE SET
+           revision = EXCLUDED.revision,
+           object_key = EXCLUDED.object_key,
+           content_type = EXCLUDED.content_type,
+           byte_length = EXCLUDED.byte_length,
+           updated_at = now()`,
+        [principal.storeId, productId, revision, objectKey, normalizedType, body.byteLength],
+      );
+      await this.activity?.record(client, {
+        storeId: principal.storeId,
+        actor: principal,
+        category: 'products',
+        action: 'product.image_uploaded',
+        entityType: 'product',
+        entityId: productId,
+        summary: 'Updated a product image',
+        details: { revision, contentType: normalizedType, byteLength: body.byteLength },
+      });
+    };
+    if (this.activity) await this.database.transaction(persist);
+    else await persist(this.database);
     return { accepted: true, productId, revision, byteLength: body.byteLength };
   }
 
@@ -43,7 +59,21 @@ export class ProductImagesService {
 
   async delete(principal: SessionPrincipal, productId: string, revision: string) {
     await this.storage.delete(this.objectKey(principal.storeId, productId, revision));
-    await this.database.query('DELETE FROM product_images WHERE store_id = $1 AND product_id = $2 AND revision = $3', [principal.storeId, productId, revision]);
+    const persist = async (client: { query: DatabaseService['query'] }) => {
+      await client.query('DELETE FROM product_images WHERE store_id = $1 AND product_id = $2 AND revision = $3', [principal.storeId, productId, revision]);
+      await this.activity?.record(client, {
+        storeId: principal.storeId,
+        actor: principal,
+        category: 'products',
+        action: 'product.image_deleted',
+        entityType: 'product',
+        entityId: productId,
+        summary: 'Removed a product image',
+        details: { revision },
+      });
+    };
+    if (this.activity) await this.database.transaction(persist);
+    else await persist(this.database);
     return { deleted: true, productId, revision };
   }
 

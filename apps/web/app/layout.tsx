@@ -6,6 +6,7 @@ export const metadata: Metadata = {
   description: 'Fast, offline-first sari-sari store point of sale.',
   applicationName: 'GMA Store POS',
   manifest: '/manifest.webmanifest',
+  icons: { icon: '/favicon.ico', apple: '/icon-192.png' },
   appleWebApp: { capable: true, title: 'GMA POS', statusBarStyle: 'default' },
   formatDetection: { telephone: false },
 };
@@ -13,7 +14,6 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
-  maximumScale: 1,
   themeColor: '#f7f5ef',
 };
 

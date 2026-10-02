@@ -2,8 +2,15 @@ import { deflateSync } from 'node:zlib';
 import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const sizes = [192, 512];
-for (const size of sizes) {
+const appIconSizes = [192, 512];
+for (const size of appIconSizes) {
+  writeFileSync(resolve(`apps/web/public/icon-${size}.png`), encodePng(size, size, createIconPixels(size)));
+}
+
+const faviconPngs = [16, 32, 48].map((size) => encodePng(size, size, createIconPixels(size)));
+writeFileSync(resolve('apps/web/public/favicon.ico'), encodeIco(faviconPngs));
+
+function createIconPixels(size) {
   const pixels = Buffer.alloc(size * size * 4);
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
@@ -31,7 +38,7 @@ for (const size of sizes) {
       if ((ring && !rightOpening) || crossbar || innerStem) pixels.set(cream, (y * size + x) * 4);
     }
   }
-  writeFileSync(resolve(`apps/web/public/icon-${size}.png`), encodePng(size, size, pixels));
+  return pixels;
 }
 
 function encodePng(width, height, rgba) {
@@ -42,6 +49,33 @@ function encodePng(width, height, rgba) {
   const raw = Buffer.alloc((width * 4 + 1) * height);
   for (let y = 0; y < height; y += 1) rgba.copy(raw, y * (width * 4 + 1) + 1, y * width * 4, (y + 1) * width * 4);
   return Buffer.concat([signature, chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+
+function encodeIco(pngs) {
+  const header = Buffer.alloc(6);
+  header.writeUInt16LE(0, 0);
+  header.writeUInt16LE(1, 2);
+  header.writeUInt16LE(pngs.length, 4);
+
+  const entries = [];
+  let offset = header.length + pngs.length * 16;
+  for (const png of pngs) {
+    const width = png.readUInt32BE(16);
+    const height = png.readUInt32BE(20);
+    const entry = Buffer.alloc(16);
+    entry.writeUInt8(width >= 256 ? 0 : width, 0);
+    entry.writeUInt8(height >= 256 ? 0 : height, 1);
+    entry.writeUInt8(0, 2);
+    entry.writeUInt8(0, 3);
+    entry.writeUInt16LE(1, 4);
+    entry.writeUInt16LE(32, 6);
+    entry.writeUInt32LE(png.length, 8);
+    entry.writeUInt32LE(offset, 12);
+    entries.push(entry);
+    offset += png.length;
+  }
+
+  return Buffer.concat([header, ...entries, ...pngs]);
 }
 
 function chunk(type, data) {

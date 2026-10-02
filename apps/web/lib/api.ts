@@ -2,10 +2,13 @@
 
 import type {
   AuthSession,
+  ActivityLogFilters,
+  ActivityLogListResponse,
   AuthSessionResponse,
   BackupSummary,
   CashierLoginRequest,
   CreateStaffRequest,
+  ManagerActionConfirmationResponse,
   OwnerLoginRequest,
   ResetStaffSecretRequest,
   SetupOwnerRequest,
@@ -27,6 +30,7 @@ import type {
 } from '@gma/contracts';
 import {
   applyServerSync,
+  cacheActivityLogs,
   clearConflictMessage,
   getActiveStoreId,
   getConflictMessage,
@@ -46,6 +50,7 @@ import {
   db,
 } from './db';
 import { flushProductImageDeletes, flushProductImageUploads } from './product-images';
+import { hydrateQrPhImage } from './qr-ph';
 
 const API_DEFAULT = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
 const MANAGER_ACCESS_DENIED_MESSAGE = 'You do not have access to this action';
@@ -151,6 +156,7 @@ export async function bootstrapStore(storeId: string, token: string, apiUrl = AP
   if (!response.session.store) throw new Error('Store bootstrap did not return a store session');
   await saveSession(response.session);
   await replaceStoreSnapshot(response.snapshot, response.cursor);
+  await hydrateQrPhImage(apiUrl).catch(() => undefined);
   await clearConflictMessage();
   return response.session;
 }
@@ -163,6 +169,7 @@ export async function syncStore(apiUrl = API_DEFAULT) {
     headers: { authorization: `Bearer ${token}` },
   });
   await applyServerSync(response);
+  await hydrateQrPhImage(apiUrl).catch(() => undefined);
   return response;
 }
 
@@ -182,11 +189,54 @@ export async function logout(apiUrl = API_DEFAULT) {
 }
 
 export async function createCommandRequest(command: StoreCommand): Promise<StoreCommandRequest> {
+  const actorProof = await getSessionToken();
   return {
     clientCommandId: crypto.randomUUID(),
     baseCursor: await getSyncCursor(),
+    occurredAt: new Date().toISOString(),
+    ...(actorProof ? { actorProof } : {}),
     command,
   };
+}
+
+export async function runManagerApprovedCommand(command: StoreCommand, password: string, apiUrl = API_DEFAULT) {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    throw new Error('Connect to the internet to verify your password and adjust stock.');
+  }
+  await requestSync(apiUrl);
+  const queue = await getMutationQueueSummary();
+  if (queue.totalCount > 0) {
+    throw new Error('Finish syncing pending work before adjusting stock.');
+  }
+  const session = await requireStoreSession();
+  const request = await createCommandRequest(command);
+  const confirmation = await apiAuthed<ManagerActionConfirmationResponse>('/v1/auth/confirm-manager-action', {
+    method: 'POST',
+    body: JSON.stringify({ action: 'adjust_stock', clientCommandId: request.clientCommandId, password }),
+  }, apiUrl);
+  const response = await apiAuthed<StoreCommandResponse>(`/v1/stores/${session.store.id}/commands`, {
+    method: 'POST',
+    body: JSON.stringify({ ...request, managerApprovalProof: confirmation.proof }),
+  }, apiUrl);
+  await applyServerSync(response);
+  if (response.status === 'conflict') throw new Error(response.message);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('pos-data-changed'));
+    window.dispatchEvent(new Event('pos-sync-state-changed'));
+  }
+  return response;
+}
+
+export async function listActivityLogs(filters: ActivityLogFilters = {}, apiUrl = API_DEFAULT) {
+  const session = await requireStoreSession();
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+  }
+  const suffix = query.size ? `?${query.toString()}` : '';
+  const response = await apiAuthed<ActivityLogListResponse>(`/v1/stores/${session.store.id}/activity-logs${suffix}`, {}, apiUrl);
+  await cacheActivityLogs(response.activity);
+  return response;
 }
 
 export async function getSyncState(): Promise<SyncState> {
@@ -233,6 +283,7 @@ export async function flushMutationQueue(apiUrl = API_DEFAULT) {
 }
 
 export async function retryNeedsAttention(apiUrl = API_DEFAULT) {
+  await repairInvalidProductUnitCommands();
   await db.mutationQueue.where('status').equals('needs_attention').modify({
     status: 'pending',
     errorMessage: null,
@@ -304,6 +355,72 @@ async function runSync(apiUrl: string) {
 
 function dispatchSyncStateChanged() {
   if (typeof window !== 'undefined') window.dispatchEvent(new Event('pos-sync-state-changed'));
+}
+
+async function repairInvalidProductUnitCommands() {
+  const items = await db.mutationQueue.where('status').equals('needs_attention').toArray();
+  for (const item of items) {
+    if (!item.errorMessage?.includes('productUnitId') || !item.errorMessage.includes('Invalid UUID')) continue;
+    const command = item.request.command;
+    if (!('productUnitId' in command.payload) || typeof command.payload.productUnitId !== 'string' || isUuid(command.payload.productUnitId)) continue;
+    const [product, staleUnit] = await Promise.all([
+      db.products.get(command.payload.productId),
+      db.productUnits.get(command.payload.productUnitId),
+    ]);
+    if (!product || !staleUnit) continue;
+    const matchingUnit = await db.productUnits
+      .where('productId')
+      .equals(product.id)
+      .filter((unit) => isUuid(unit.id) && unit.isActive && unit.canRestock
+        && unit.multiplierBaseUnits === staleUnit.multiplierBaseUnits
+        && unit.quantityStep === staleUnit.quantityStep
+        && unit.name === staleUnit.name)
+      .first();
+    if (matchingUnit) {
+      await db.mutationQueue.update(item.id, {
+        request: {
+          ...item.request,
+          command: {
+            ...command,
+            payload: { ...command.payload, productUnitId: matchingUnit.id },
+          } as StoreCommand,
+        },
+      });
+      continue;
+    }
+    if (command.type === 'receiveStock') {
+      const displayQuantity = command.payload.inputQuantity * staleUnit.multiplierBaseUnits / legacyDisplayMultiplier(product.unit);
+      if (!Number.isFinite(displayQuantity) || displayQuantity <= 0) continue;
+      await db.mutationQueue.update(item.id, {
+        request: {
+          ...item.request,
+          command: {
+            type: 'restockProduct',
+            payload: {
+              productId: product.id,
+              mode: 'add',
+              quantity: normalizeQuantity(displayQuantity),
+              note: command.payload.note,
+              expectedVersion: Math.max(1, product.recordVersion - 1),
+            },
+          },
+        },
+      });
+    }
+  }
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function legacyDisplayMultiplier(unit: string) {
+  const normalized = unit.trim().toLowerCase();
+  return ['kg', 'kilogram', 'liter', 'litre'].includes(normalized) ? 1000 : 1;
+}
+
+function normalizeQuantity(value: number) {
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
 export async function listStaff(apiUrl = API_DEFAULT) {
@@ -435,9 +552,58 @@ async function apiRequest<T = unknown>(baseUrl: string, path: string, init: Requ
 
 async function readableApiError(response: Response) {
   try {
-    const body = await response.json() as { message?: string | string[] };
-    return Array.isArray(body.message) ? body.message.join(', ') : body.message || `Request failed (${response.status})`;
+    return describeApiError(await response.json(), response.status);
   } catch {
     return `Request failed (${response.status})`;
   }
+}
+
+function describeApiError(body: unknown, status: number) {
+  const fallback = `Request failed (${status})`;
+  if (!body || typeof body !== 'object') return fallback;
+  const record = body as Record<string, unknown>;
+  const message = normalizeApiMessage(record.message);
+  const details = validationDetails(record.issues ?? record.errors ?? record.message);
+  if (details.length) return `${message ?? fallback}: ${details.join('; ')}`;
+  if (message) return message;
+  if (typeof record.error === 'string' && record.error.trim()) return `${record.error.trim()} (${status})`;
+  return fallback;
+}
+
+function normalizeApiMessage(value: unknown) {
+  if (typeof value === 'string') return value.trim() || null;
+  if (Array.isArray(value)) {
+    const messages = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+    return messages.length ? messages.join(', ') : null;
+  }
+  return null;
+}
+
+function validationDetails(value: unknown): string[] {
+  if (!value || typeof value !== 'object') return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const issue = item as { path?: unknown; message?: unknown };
+      if (typeof issue.message !== 'string') return [];
+      const path = Array.isArray(issue.path) ? issue.path.map(String).join('.') : '';
+      return path ? `${path}: ${issue.message}` : issue.message;
+    });
+  }
+  const record = value as Record<string, unknown>;
+  const details: string[] = [];
+  const formErrors = record.formErrors;
+  if (Array.isArray(formErrors)) {
+    details.push(...formErrors.filter((item): item is string => typeof item === 'string'));
+  }
+  const fieldErrors = record.fieldErrors;
+  if (fieldErrors && typeof fieldErrors === 'object') {
+    for (const [field, messages] of Object.entries(fieldErrors as Record<string, unknown>)) {
+      if (Array.isArray(messages)) {
+        const text = messages.filter((item): item is string => typeof item === 'string').join(', ');
+        if (text) details.push(`${field}: ${text}`);
+      }
+    }
+  }
+  return details;
 }

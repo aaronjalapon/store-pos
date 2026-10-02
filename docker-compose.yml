@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: pos
       POSTGRES_PASSWORD: pos
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -16,7 +16,11 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    build:
+      context: ./docker/minio
+      args:
+        MINIO_VERSION: RELEASE.2025-10-15T17-29-55Z
+    image: gma-pos/minio:RELEASE.2025-10-15T17-29-55Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -26,17 +30,26 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9000/minio/health/ready >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   minio-init:
-    image: minio/mc:latest
+    image: amazon/aws-cli:2.36.44
     depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      until /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
-      /usr/bin/mc mb --ignore-existing local/gma-pos-backups;
-      exit 0;
-      "
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        aws --endpoint-url http://minio:9000 s3api head-bucket --bucket gma-pos-backups ||
+        aws --endpoint-url http://minio:9000 s3api create-bucket --bucket gma-pos-backups
 
 volumes:
   postgres_data:

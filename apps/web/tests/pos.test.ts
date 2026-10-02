@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { db, saveSession } from '../lib/db';
-import { completeSale, receiveStock, restockProduct, saveProduct } from '../lib/pos';
+import { adjustStock, completeSale, receiveStock, restockProduct, reviewQrPayment, saveProduct } from '../lib/pos';
 
 const now = new Date().toISOString();
 
@@ -26,6 +26,7 @@ describe('offline checkout transaction', () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await db.delete();
   });
 
@@ -57,6 +58,89 @@ describe('offline checkout transaction', () => {
     expect(await db.saleItems.count()).toBe(0);
     expect(await db.mutationQueue.count()).toBe(0);
     expect((await db.products.get(product.id))?.stockQuantity).toBe(3);
+  });
+
+  it('does not queue or store a password-protected stock adjustment while offline', async () => {
+    const product = (await db.products.toArray())[0];
+    await expect(adjustStock(product, 2, 'Manual stock adjustment', 'owner-password'))
+      .rejects.toThrow('Connect to the internet');
+    expect(await db.mutationQueue.count()).toBe(0);
+    expect((await db.products.get(product.id))?.stockQuantity).toBe(3);
+  });
+
+  it('verifies the manager password without placing it in the stock command or offline queue', async () => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
+    const product = (await db.products.toArray())[0];
+    const snapshot = (stockQuantity: number, recordVersion: number) => ({
+      products: [{ ...product, stockQuantity, recordVersion }], productUnits: [], sales: [], saleItems: [],
+      inventoryMovements: [], customers: [], utangEntries: [], expenses: [], staff: [], qrPayments: [], paymentSettings: null,
+    });
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ cursor: 1, snapshot: snapshot(3, 1) }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ proof: 'manager-proof' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'applied', cursor: 2, snapshot: snapshot(2, 2), message: 'Stock updated.' }), { status: 200 }));
+
+    await adjustStock(product, 2, 'Manual stock adjustment', 'owner-password');
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const confirmationBody = String(fetchMock.mock.calls[1][1]?.body);
+    const commandBody = String(fetchMock.mock.calls[2][1]?.body);
+    expect(confirmationBody).toContain('owner-password');
+    expect(commandBody).toContain('manager-proof');
+    expect(commandBody).not.toContain('owner-password');
+    expect(await db.mutationQueue.count()).toBe(0);
+    expect(await db.products.get(product.id)).toMatchObject({ stockQuantity: 2, recordVersion: 2 });
+  });
+
+  it('atomically saves a merchant-confirmed QR Ph payment with its sale', async () => {
+    const product = (await db.products.toArray())[0];
+    const result = await completeSale({
+      cart: [{ product, quantity: 1 }], paymentMethod: 'qrph', cashReceived: null, customerId: null,
+      qrPayment: { reference: 'QRPH-123 456', confirmationSource: 'merchant_notification' },
+    });
+    const payment = await db.qrPayments.where('saleId').equals(result.saleId).first();
+    expect(result.qrPaymentStatus).toBe('merchant_confirmed');
+    expect(payment).toMatchObject({
+      amount: 900, reference: 'QRPH-123 456', normalizedReference: 'QRPH123456',
+      confirmationSource: 'merchant_notification', status: 'merchant_confirmed', attentionReason: null,
+    });
+    expect((await db.mutationQueue.toArray())[0].request.command).toMatchObject({
+      type: 'completeSale', payload: { paymentMethod: 'qrph', qrPayment: { reference: 'QRPH-123 456' } },
+    });
+  });
+
+  it('keeps a rejected customer-proof sale and stock movement while marking the payment unpaid', async () => {
+    const product = (await db.products.toArray())[0];
+    const result = await completeSale({
+      cart: [{ product, quantity: 1 }], paymentMethod: 'qrph', cashReceived: null, customerId: null,
+      qrPayment: { reference: 'CUSTOMER-987', confirmationSource: 'customer_proof' },
+    });
+    const payment = await db.qrPayments.where('saleId').equals(result.saleId).first();
+    expect(payment?.status).toBe('pending_review');
+
+    await reviewQrPayment(payment!.id, 'reject', 'Not found in merchant account');
+
+    expect(await db.sales.get(result.saleId)).toBeTruthy();
+    expect((await db.products.get(product.id))?.stockQuantity).toBe(2);
+    expect(await db.qrPayments.get(payment!.id)).toMatchObject({ status: 'rejected', reviewNote: 'Not found in merchant account', recordVersion: 2 });
+    expect((await db.mutationQueue.orderBy('createdAt').toArray()).map((item) => item.request.command.type)).toEqual(['completeSale', 'reviewQrPayment']);
+  });
+
+  it('downgrades a duplicate collected QR reference to pending review locally', async () => {
+    const firstProduct = (await db.products.toArray())[0];
+    await completeSale({
+      cart: [{ product: firstProduct, quantity: 1 }], paymentMethod: 'qrph', cashReceived: null, customerId: null,
+      qrPayment: { reference: 'DUP-100', confirmationSource: 'merchant_notification' },
+    });
+    const current = (await db.products.get(firstProduct.id))!;
+    const second = await completeSale({
+      cart: [{ product: current, quantity: 1 }], paymentMethod: 'qrph', cashReceived: null, customerId: null,
+      qrPayment: { reference: 'dup 100', confirmationSource: 'merchant_notification' },
+    });
+    expect(second.qrPaymentStatus).toBe('pending_review');
+    expect(await db.qrPayments.where('saleId').equals(second.saleId).first()).toMatchObject({
+      status: 'pending_review', attentionReason: 'duplicate_reference', normalizedReference: 'DUP100',
+    });
   });
 
   it('quick restocks by adding incoming stock from the current product row', async () => {
@@ -227,6 +311,21 @@ describe('offline checkout transaction', () => {
     expect((await db.productImages.get(product.id))?.revision).toBe(replacement.revision);
     expect(await db.productImageQueue.get(`upload:${product.id}:${replacement.revision}`)).toBeTruthy();
     expect(await db.productImageQueue.get(`delete:${product.id}:${firstImage.revision}`)).toBeTruthy();
+  });
+
+  it('queues the same product id that was saved locally', async () => {
+    const product = await saveProduct({
+      name: 'Instant coffee', category: 'Drinks', costPrice: 500,
+      sellingPrice: 700, stockQuantity: 10, unit: 'sachet',
+      lowStockThreshold: 2, isQuickItem: true,
+    });
+
+    const queued = await db.mutationQueue.toArray();
+    expect(queued).toHaveLength(1);
+    expect(queued[0].request.command).toMatchObject({
+      type: 'saveProduct',
+      payload: { id: product.id },
+    });
   });
 
   it('rejects duplicate barcodes without replacing form data', async () => {

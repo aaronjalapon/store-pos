@@ -3,11 +3,15 @@
 import Dexie, { type EntityTable } from 'dexie';
 import type {
   AuthSession,
+  ActivityActor,
+  ActivityLog,
   Customer,
   Expense,
   InventoryMovement,
   Product,
   ProductUnit,
+  QrPayment,
+  QrPhPaymentSettings,
   Sale,
   SaleItem,
   StoreCommandRequest,
@@ -29,7 +33,11 @@ export interface MutationQueueItem {
   attemptCount: number;
   lastAttemptAt: string | null;
   errorMessage: string | null;
+  actor?: ActivityActor;
+  deviceName?: string | null;
 }
+
+export type ActivityLogCacheRecord = ActivityLog;
 
 export interface ProductImageRecord {
   productId: string;
@@ -50,6 +58,15 @@ export interface ProductImageQueueItem {
   lastAttemptAt: string | null;
 }
 
+export interface QrPhImageRecord {
+  key: 'qrph';
+  revision: string;
+  blob: Blob;
+  contentType: QrPhPaymentSettings['contentType'];
+  byteLength: number;
+  updatedAt: string;
+}
+
 export class PosDatabase extends Dexie {
   products!: EntityTable<Product, 'id'>;
   productUnits!: EntityTable<ProductUnit, 'id'>;
@@ -63,6 +80,10 @@ export class PosDatabase extends Dexie {
   mutationQueue!: EntityTable<MutationQueueItem, 'id'>;
   productImages!: EntityTable<ProductImageRecord, 'productId'>;
   productImageQueue!: EntityTable<ProductImageQueueItem, 'id'>;
+  activityLogCache!: EntityTable<ActivityLogCacheRecord, 'id'>;
+  qrPayments!: EntityTable<QrPayment, 'id'>;
+  paymentSettings!: EntityTable<QrPhPaymentSettings, 'storeId'>;
+  qrPhImages!: EntityTable<QrPhImageRecord, 'key'>;
 
   constructor(name = 'gma-store-pos') {
     super(name);
@@ -112,6 +133,39 @@ export class PosDatabase extends Dexie {
       mutationQueue: 'id, status, createdAt',
       productImages: 'productId, revision, syncStatus, updatedAt',
       productImageQueue: 'id, operation, productId, revision',
+    });
+    this.version(7).stores({
+      products: 'id, &barcode, name, category, isQuickItem, isActive, updatedAt, recordVersion, baseUnit',
+      productUnits: 'id, productId, barcode, isActive, canSell, canRestock, updatedAt',
+      sales: 'id, transactionNumber, createdAt, paymentMethod, customerId, cashierUserId',
+      saleItems: 'id, saleId, productId, productUnitId, createdAt',
+      inventoryMovements: 'id, productId, productUnitId, saleId, createdAt',
+      customers: 'id, name, isActive, updatedAt, recordVersion',
+      utangEntries: 'id, customerId, saleId, createdAt',
+      expenses: 'id, category, occurredAt, createdAt',
+      settings: 'key',
+      mutationQueue: 'id, status, createdAt',
+      productImages: 'productId, revision, syncStatus, updatedAt',
+      productImageQueue: 'id, operation, productId, revision',
+      activityLogCache: 'id, storeId, category, actor.userId, actor.role, occurredAt, clientCommandId',
+    });
+    this.version(8).stores({
+      products: 'id, &barcode, name, category, isQuickItem, isActive, updatedAt, recordVersion, baseUnit',
+      productUnits: 'id, productId, barcode, isActive, canSell, canRestock, updatedAt',
+      sales: 'id, transactionNumber, createdAt, paymentMethod, customerId, cashierUserId',
+      saleItems: 'id, saleId, productId, productUnitId, createdAt',
+      inventoryMovements: 'id, productId, productUnitId, saleId, createdAt',
+      customers: 'id, name, isActive, updatedAt, recordVersion',
+      utangEntries: 'id, customerId, saleId, createdAt',
+      expenses: 'id, category, occurredAt, createdAt',
+      settings: 'key',
+      mutationQueue: 'id, status, createdAt',
+      productImages: 'productId, revision, syncStatus, updatedAt',
+      productImageQueue: 'id, operation, productId, revision',
+      activityLogCache: 'id, storeId, category, actor.userId, actor.role, occurredAt, clientCommandId',
+      qrPayments: 'id, &saleId, storeId, status, normalizedReference, confirmedAt',
+      paymentSettings: 'storeId, imageRevision, updatedAt',
+      qrPhImages: 'key, revision, updatedAt',
     });
   }
 }
@@ -191,7 +245,7 @@ export async function clearSession() {
 export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: number, skipWhenQueued = false) {
   const replaced = await db.transaction(
     'rw',
-    [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.settings, db.mutationQueue],
+    [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.qrPayments, db.paymentSettings, db.settings, db.mutationQueue],
     async () => {
       if (skipWhenQueued && await db.mutationQueue.count() > 0) return false;
       await Promise.all([
@@ -203,6 +257,8 @@ export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: numb
         db.customers.clear(),
         db.utangEntries.clear(),
         db.expenses.clear(),
+        db.qrPayments.clear(),
+        db.paymentSettings.clear(),
       ]);
       await Promise.all([
         snapshot.products.length ? db.products.bulkPut(snapshot.products) : Promise.resolve(),
@@ -213,6 +269,8 @@ export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: numb
         snapshot.customers.length ? db.customers.bulkPut(snapshot.customers) : Promise.resolve(),
         snapshot.utangEntries.length ? db.utangEntries.bulkPut(snapshot.utangEntries) : Promise.resolve(),
         snapshot.expenses.length ? db.expenses.bulkPut(snapshot.expenses) : Promise.resolve(),
+        snapshot.qrPayments?.length ? db.qrPayments.bulkPut(snapshot.qrPayments) : Promise.resolve(),
+        snapshot.paymentSettings ? db.paymentSettings.put(snapshot.paymentSettings) : Promise.resolve(),
       ]);
       await setSetting(CURSOR_KEY, cursor);
       await setSetting(BOOTSTRAP_KEY, true);
@@ -228,15 +286,37 @@ export async function applyServerSync(sync: StoreSyncResponse) {
 }
 
 export async function queueCommand(request: StoreCommandRequest) {
+  const [session, deviceName, latest] = await Promise.all([getSession(), getDeviceName(), db.mutationQueue.orderBy('createdAt').last()]);
+  const createdAt = new Date(Math.max(Date.now(), latest ? Date.parse(latest.createdAt) + 1 : 0)).toISOString();
   await db.mutationQueue.put({
     id: request.clientCommandId,
     request,
-    createdAt: new Date().toISOString(),
+    createdAt,
     status: 'pending',
     attemptCount: 0,
     lastAttemptAt: null,
     errorMessage: null,
+    actor: session ? {
+      userId: session.user.id,
+      displayName: session.user.displayName,
+      role: session.user.role,
+    } : undefined,
+    deviceName,
   });
+}
+
+export async function cacheActivityLogs(activity: ActivityLog[]) {
+  if (!activity.length) return;
+  await db.transaction('rw', db.activityLogCache, async () => {
+    await db.activityLogCache.bulkPut(activity.filter((item) => item.status === 'confirmed'));
+    const all = await db.activityLogCache.orderBy('occurredAt').reverse().toArray();
+    if (all.length > 500) await db.activityLogCache.bulkDelete(all.slice(500).map((item) => item.id));
+  });
+}
+
+export async function getCachedActivityLogs(storeId: string) {
+  const activity = await db.activityLogCache.where('storeId').equals(storeId).toArray();
+  return activity.sort((left, right) => right.occurredAt.localeCompare(left.occurredAt));
 }
 
 export async function removeQueuedCommand(id: string) {
@@ -288,7 +368,7 @@ export async function signOutLocally() {
 }
 
 export async function removeLocalStoreData() {
-  await db.transaction('rw', [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.mutationQueue, db.productImages, db.productImageQueue], async () => {
+  await db.transaction('rw', [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.mutationQueue, db.productImages, db.productImageQueue, db.activityLogCache, db.qrPayments, db.paymentSettings, db.qrPhImages], async () => {
     await Promise.all([
       db.products.clear(),
       db.productUnits.clear(),
@@ -301,6 +381,10 @@ export async function removeLocalStoreData() {
       db.mutationQueue.clear(),
       db.productImages.clear(),
       db.productImageQueue.clear(),
+      db.activityLogCache.clear(),
+      db.qrPayments.clear(),
+      db.paymentSettings.clear(),
+      db.qrPhImages.clear(),
     ]);
   });
   await clearSession();

@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useId, useRef, useState } from 'react';
-import { Camera, X } from 'lucide-react';
+import { Camera } from 'lucide-react';
+import { AppModal } from './app-modal';
 
 interface BarcodeDetectorLike {
   detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>>;
@@ -84,9 +85,8 @@ export function CameraScanner({
   }, [onCode]);
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Scan barcode">
+    <AppModal title="Scan barcode" description="Point the camera at a barcode or enter the code manually." onClose={onClose} className="scanner-modal">
       <div className="scanner-card">
-        <button className="icon-button scanner-close" onClick={onClose} aria-label="Close scanner"><X /></button>
         <div className="scanner-stage">
           <video ref={videoRef} muted playsInline />
           <div className="scan-window" />
@@ -152,6 +152,6 @@ export function CameraScanner({
           <button className="secondary-button" type="submit">Use code</button>
         </form>
       </div>
-    </div>
+    </AppModal>
   );
 }

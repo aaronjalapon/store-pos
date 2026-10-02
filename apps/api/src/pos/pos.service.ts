@@ -1,7 +1,8 @@
-import { ConflictException, ForbiddenException, Injectable } from '@nestjs/common';
+import { ConflictException, ForbiddenException, Injectable, Optional } from '@nestjs/common';
 import type {
   CommandConflictReason,
   Product,
+  QrPayment,
   StoreCommand,
   StoreCommandRequest,
   StoreCommandResponse,
@@ -9,6 +10,8 @@ import type {
 import { DatabaseService } from '../database/database.service';
 import type { SessionPrincipal } from '../auth/auth.types';
 import { StoreDataService } from '../stores/store-data.service';
+import { AuthService } from '../auth/auth.service';
+import { ActivityService } from '../activity/activity.service';
 
 interface ProductRow {
   id: string;
@@ -66,6 +69,13 @@ interface CustomerRow {
   name: string;
 }
 
+interface QrPaymentRow {
+  id: string;
+  status: QrPayment['status'];
+  normalized_reference: string;
+  record_version: number;
+}
+
 interface ProcessedCommandRow {
   result_json: Record<string, unknown> | null;
 }
@@ -75,15 +85,23 @@ export class PosService {
   constructor(
     private readonly database: DatabaseService,
     private readonly data: StoreDataService,
+    @Optional() private readonly auth?: AuthService,
+    @Optional() private readonly activity?: ActivityService,
   ) {}
 
   async applyCommand(principal: SessionPrincipal, request: StoreCommandRequest): Promise<StoreCommandResponse> {
+    const actor = await this.resolveCommandActor(principal, request);
+    if (request.command.type === 'adjustStock') {
+      this.requireRole(actor, ['owner', 'admin']);
+      if (!this.auth) throw new ForbiddenException('Password approval is unavailable');
+      await this.auth.verifyManagerActionProof(actor, request.managerApprovalProof, 'adjust_stock', request.clientCommandId);
+    }
     const bootstrapped = await this.database.query<{ first_synced_at: Date | null }>(
       'SELECT first_synced_at FROM devices WHERE id = $1 AND store_id = $2',
-      [principal.deviceId, principal.storeId],
+      [actor.deviceId, actor.storeId],
     );
     if (!bootstrapped.rows[0]?.first_synced_at) {
-      return this.conflict(principal.storeId, 'device_not_bootstrapped', 'This browser must finish its first sync before it can save offline work.');
+      return this.conflict(actor.storeId, 'device_not_bootstrapped', 'This browser must finish its first sync before it can save offline work.');
     }
 
     try {
@@ -94,14 +112,14 @@ export class PosService {
            VALUES ($1, $2, $3, $4, NULL)
            ON CONFLICT (store_id, device_id, client_command_id) DO NOTHING
            RETURNING client_command_id`,
-          [principal.storeId, principal.deviceId, request.clientCommandId, request.command.type],
+          [actor.storeId, actor.deviceId, request.clientCommandId, request.command.type],
         );
         if (!claim.rows[0]) {
           const existing = await client.query<ProcessedCommandRow>(
             `SELECT result_json
                FROM processed_commands
               WHERE store_id = $1 AND device_id = $2 AND client_command_id = $3`,
-            [principal.storeId, principal.deviceId, request.clientCommandId],
+            [actor.storeId, actor.deviceId, request.clientCommandId],
           );
           if (!existing.rows[0]?.result_json) throw new Error('Processed command result is unavailable');
           return existing.rows[0].result_json;
@@ -110,60 +128,65 @@ export class PosService {
         let commandResult: Record<string, unknown>;
         switch (request.command.type) {
           case 'saveProduct':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.saveProduct(client, principal, request.command);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.saveProduct(client, actor, request.command);
             break;
           case 'completeSale':
-            commandResult = await this.completeSale(client, principal, request.command);
+            commandResult = await this.completeSale(client, actor, request.command);
+            break;
+          case 'reviewQrPayment':
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.reviewQrPayment(client, actor, request.command);
             break;
           case 'adjustStock':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.adjustStock(client, principal, request.command.payload.productId, request.command.payload.newQuantity, request.command.payload.note, request.command.payload.expectedVersion);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.adjustStock(client, actor, request.command.payload.productId, request.command.payload.newQuantity, request.command.payload.note, request.command.payload.expectedVersion);
             break;
           case 'restockProduct':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.restockProduct(client, principal, request.command.payload.productId, request.command.payload.mode, request.command.payload.quantity, request.command.payload.note, request.command.payload.expectedVersion);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.restockProduct(client, actor, request.command.payload.productId, request.command.payload.mode, request.command.payload.quantity, request.command.payload.note, request.command.payload.expectedVersion);
             break;
           case 'receiveStock':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.receiveStock(client, principal, request.command.payload.productId, request.command.payload.productUnitId, request.command.payload.inputQuantity, request.command.payload.note);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.receiveStock(client, actor, request.command.payload.productId, request.command.payload.productUnitId, request.command.payload.inputQuantity, request.command.payload.note);
             break;
           case 'countStock':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.countStock(client, principal, request.command.payload);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.countStock(client, actor, request.command.payload);
             break;
           case 'adjustStockDelta':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.adjustStockDelta(client, principal, request.command.payload);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.adjustStockDelta(client, actor, request.command.payload);
             break;
           case 'createCustomer':
-            commandResult = await this.createCustomer(client, principal, request.command.payload.name);
+            commandResult = await this.createCustomer(client, actor, request.command.payload.name);
             break;
           case 'recordUtangPayment':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.recordUtangPayment(client, principal, request.command.payload.customerId, request.command.payload.amount, request.command.payload.note);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.recordUtangPayment(client, actor, request.command.payload.customerId, request.command.payload.amount, request.command.payload.note);
             break;
           case 'recordExpense':
-            this.requireRole(principal, ['owner', 'admin']);
-            commandResult = await this.recordExpense(client, principal, request.command.payload.category, request.command.payload.description, request.command.payload.amount, request.command.payload.occurredAt);
+            this.requireRole(actor, ['owner', 'admin']);
+            commandResult = await this.recordExpense(client, actor, request.command.payload.category, request.command.payload.description, request.command.payload.amount, request.command.payload.occurredAt);
             break;
           default:
             throw new ConflictException('Unsupported command');
         }
+        await this.recordCommandActivity(client, actor, principal, request, commandResult);
         await client.query(
           `UPDATE processed_commands
               SET result_json = $4::jsonb, processed_at = now()
             WHERE store_id = $1 AND device_id = $2 AND client_command_id = $3`,
-          [principal.storeId, principal.deviceId, request.clientCommandId, JSON.stringify(commandResult)],
+          [actor.storeId, actor.deviceId, request.clientCommandId, JSON.stringify(commandResult)],
         );
         return commandResult;
       });
-      const snapshot = await this.data.loadSnapshot(principal.storeId);
-      const cursor = await this.data.currentCursor(principal.storeId);
+      const snapshot = await this.data.loadSnapshot(actor.storeId);
+      const cursor = await this.data.currentCursor(actor.storeId);
       return { status: 'applied', cursor, snapshot, ...result };
     } catch (error) {
       if (error instanceof StaleConflict) {
-        return this.conflict(principal.storeId, error.reason, error.message);
+        return this.conflict(actor.storeId, error.reason, error.message);
       }
       throw error;
     }
@@ -320,13 +343,16 @@ export class PosService {
       }
     }
     await this.data.createSyncEvent(client, principal.storeId, 'product');
-    return { message: current ? 'Product updated.' : 'Product created.' };
+    return { productId: id, message: current ? 'Product updated.' : 'Product created.' };
   }
 
   private async completeSale(client: { query: DatabaseService['query'] }, principal: SessionPrincipal, command: Extract<StoreCommand, { type: 'completeSale' }>) {
     if (!command.payload.cart.length) throw new ConflictException('Cart is empty');
     if (command.payload.paymentMethod === 'utang' && !command.payload.customerId) {
       throw new ConflictException('Select an utang customer');
+    }
+    if (command.payload.paymentMethod === 'qrph' && !command.payload.qrPayment) {
+      throw new ConflictException('QR Ph payment details are required');
     }
     const productsResult = await client.query<ProductRow>(
       'SELECT * FROM products WHERE store_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE',
@@ -369,6 +395,43 @@ export class PosService {
         command.payload.paymentMethod, command.payload.cashReceived, change, now,
       ],
     );
+
+    let qrPaymentStatus: QrPayment['status'] | null = null;
+    if (command.payload.paymentMethod === 'qrph' && command.payload.qrPayment) {
+      const qr = command.payload.qrPayment;
+      const normalizedReference = this.normalizeQrReference(qr.reference);
+      if (!normalizedReference) throw new ConflictException('Enter a valid QR Ph reference number');
+      const requestedStatus: QrPayment['status'] = qr.confirmationSource === 'merchant_notification'
+        ? 'merchant_confirmed'
+        : 'pending_review';
+      const requestedReason: QrPayment['attentionReason'] = qr.confirmationSource === 'customer_proof'
+        ? 'customer_proof'
+        : null;
+      const inserted = await client.query(
+        `INSERT INTO qr_payments
+         (id, store_id, sale_id, cashier_user_id, cashier_display_name_snapshot, device_id, amount, reference, normalized_reference,
+          confirmation_source, status, attention_reason, confirmed_at, record_version, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $13, $13)
+         ON CONFLICT (store_id, normalized_reference)
+         WHERE status IN ('merchant_confirmed', 'verified') DO NOTHING
+         RETURNING id`,
+        [qr.id, principal.storeId, saleId, principal.userId, principal.displayName, principal.deviceId, total, qr.reference.trim(), normalizedReference,
+          qr.confirmationSource, requestedStatus, requestedReason, now],
+      );
+      if (inserted.rows[0]) {
+        qrPaymentStatus = requestedStatus;
+      } else {
+        await client.query(
+          `INSERT INTO qr_payments
+           (id, store_id, sale_id, cashier_user_id, cashier_display_name_snapshot, device_id, amount, reference, normalized_reference,
+            confirmation_source, status, attention_reason, confirmed_at, record_version, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending_review', 'duplicate_reference', $11, 1, $11, $11)`,
+          [qr.id, principal.storeId, saleId, principal.userId, principal.displayName, principal.deviceId, total, qr.reference.trim(), normalizedReference,
+            qr.confirmationSource, now],
+        );
+        qrPaymentStatus = 'pending_review';
+      }
+    }
 
     const canonicalRunning = new Map<string, number>();
     for (const line of preparedLines) {
@@ -434,7 +497,51 @@ export class PosService {
     }
 
     await this.data.createSyncEvent(client, principal.storeId, 'sale');
-    return { saleId, message: 'Sale completed.' };
+    return { saleId, qrPaymentStatus, message: qrPaymentStatus === 'pending_review' ? 'Sale completed. QR Ph payment needs review.' : 'Sale completed.' };
+  }
+
+  private async reviewQrPayment(
+    client: { query: DatabaseService['query'] },
+    principal: SessionPrincipal,
+    command: Extract<StoreCommand, { type: 'reviewQrPayment' }>,
+  ) {
+    const current = await client.query<QrPaymentRow>(
+      'SELECT id, status, normalized_reference, record_version FROM qr_payments WHERE id = $1 AND store_id = $2 FOR UPDATE',
+      [command.payload.paymentId, principal.storeId],
+    );
+    const payment = current.rows[0];
+    if (!payment) throw new StaleConflict('not_found', 'This QR Ph payment no longer exists.');
+    if (payment.record_version !== command.payload.expectedVersion) {
+      throw new StaleConflict('validation_failed', 'This QR Ph payment was reviewed on another device. Refresh and try again.');
+    }
+    if (payment.status !== 'pending_review') {
+      throw new StaleConflict('validation_failed', 'Only pending QR Ph payments can be reviewed.');
+    }
+    if (command.payload.decision === 'reject' && !command.payload.note.trim()) {
+      throw new ConflictException('A rejection note is required');
+    }
+    if (command.payload.decision === 'verify') {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${principal.storeId}:${payment.normalized_reference}`]);
+      const claimed = await client.query<{ id: string }>(
+        `SELECT id FROM qr_payments
+          WHERE store_id = $1 AND normalized_reference = $2 AND id <> $3
+            AND status IN ('merchant_confirmed', 'verified')
+          LIMIT 1`,
+        [principal.storeId, payment.normalized_reference, payment.id],
+      );
+      if (claimed.rows[0]) throw new StaleConflict('validation_failed', 'This reference is already collected by another sale. Reject the duplicate payment instead.');
+    }
+    const status: QrPayment['status'] = command.payload.decision === 'verify' ? 'verified' : 'rejected';
+    const now = new Date().toISOString();
+    await client.query(
+      `UPDATE qr_payments
+          SET status = $3, attention_reason = NULL, reviewed_at = $4, reviewed_by_user_id = $5,
+              review_note = $6, record_version = record_version + 1, updated_at = $4
+        WHERE id = $1 AND store_id = $2`,
+      [payment.id, principal.storeId, status, now, principal.userId, command.payload.note.trim() || null],
+    );
+    await this.data.createSyncEvent(client, principal.storeId, 'qr_payment_review');
+    return { paymentId: payment.id, qrPaymentStatus: status, message: status === 'verified' ? 'QR Ph payment verified.' : 'QR Ph payment marked unpaid.' };
   }
 
   private async adjustStock(client: { query: DatabaseService['query'] }, principal: SessionPrincipal, productId: string, newQuantity: number, note: string, expectedVersion: number) {
@@ -444,9 +551,16 @@ export class PosService {
     }
     this.validateStockQuantity(product.sold_by_weight, product.quantity_step, newQuantity, product.unit);
     const now = new Date().toISOString();
+    const stockAfterBase = Math.round(newQuantity * this.legacyDisplayMultiplier(product));
     await client.query(
-      'UPDATE products SET stock_quantity = $3, record_version = record_version + 1, updated_at = $4, updated_by_user_id = $5 WHERE id = $1 AND store_id = $2',
-      [productId, principal.storeId, newQuantity, now, principal.userId],
+      `UPDATE products
+          SET stock_quantity = $3,
+              stock_base_quantity = CASE WHEN stock_base_quantity IS NULL THEN stock_base_quantity ELSE $6 END,
+              record_version = record_version + 1,
+              updated_at = $4,
+              updated_by_user_id = $5
+        WHERE id = $1 AND store_id = $2`,
+      [productId, principal.storeId, newQuantity, now, principal.userId, stockAfterBase],
     );
     await client.query(
       `INSERT INTO inventory_movements
@@ -668,17 +782,18 @@ export class PosService {
       [principal.storeId, normalized],
     );
     if (existing.rows[0]) {
-      return { message: existing.rows[0].is_active ? 'Customer already exists.' : 'Customer was found but is inactive.' };
+      return { customerId: existing.rows[0].id, message: existing.rows[0].is_active ? 'Customer already exists.' : 'Customer was found but is inactive.' };
     }
     const now = new Date().toISOString();
+    const customerId = crypto.randomUUID();
     await client.query(
       `INSERT INTO customers
        (id, store_id, name, nickname, phone_number, notes, is_active, record_version, created_at, updated_at, created_by_user_id, updated_by_user_id)
        VALUES ($1, $2, $3, NULL, NULL, NULL, true, 1, $4, $4, $5, $5)`,
-      [crypto.randomUUID(), principal.storeId, normalized, now, principal.userId],
+      [customerId, principal.storeId, normalized, now, principal.userId],
     );
     await this.data.createSyncEvent(client, principal.storeId, 'customer');
-    return { message: 'Customer created.' };
+    return { customerId, message: 'Customer created.' };
   }
 
   private async recordUtangPayment(client: { query: DatabaseService['query'] }, principal: SessionPrincipal, customerId: string, amount: number, note: string) {
@@ -700,14 +815,15 @@ export class PosService {
 
   private async recordExpense(client: { query: DatabaseService['query'] }, principal: SessionPrincipal, category: string, description: string, amount: number, occurredAt: string) {
     const now = new Date().toISOString();
+    const expenseId = crypto.randomUUID();
     await client.query(
       `INSERT INTO expenses
        (id, store_id, category, description, amount, occurred_at, actor_user_id, record_version, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $8)`,
-      [crypto.randomUUID(), principal.storeId, category.trim(), description.trim(), amount, occurredAt, principal.userId, now],
+      [expenseId, principal.storeId, category.trim(), description.trim(), amount, occurredAt, principal.userId, now],
     );
     await this.data.createSyncEvent(client, principal.storeId, 'expense');
-    return { message: 'Expense saved.' };
+    return { expenseId, message: 'Expense saved.' };
   }
 
   private async requireProduct(client: { query: DatabaseService['query'] }, storeId: string, productId: string) {
@@ -808,6 +924,158 @@ export class PosService {
   private calculateChange(total: number, cashReceived: number) {
     if (cashReceived < total) return null;
     return cashReceived - total;
+  }
+
+  private normalizeQrReference(reference: string) {
+    return reference.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 80);
+  }
+
+  private async resolveCommandActor(submitter: SessionPrincipal, request: StoreCommandRequest) {
+    if (!request.actorProof || !this.auth) return submitter;
+    const actor = await this.auth.verify(request.actorProof);
+    if (actor.storeId !== submitter.storeId || actor.deviceId !== submitter.deviceId) {
+      throw new ForbiddenException('The offline action proof does not match this store device');
+    }
+    return actor;
+  }
+
+  private async recordCommandActivity(
+    client: { query: DatabaseService['query'] },
+    actor: SessionPrincipal,
+    submitter: SessionPrincipal,
+    request: StoreCommandRequest,
+    result: Record<string, unknown>,
+  ) {
+    if (!this.activity) return;
+    const command = request.command;
+    let category: Parameters<ActivityService['record']>[1]['category'];
+    let action: string;
+    let entityType: string | null = null;
+    let entityId: string | null = null;
+    let summary: string;
+    let details: Record<string, unknown> = {};
+
+    switch (command.type) {
+      case 'saveProduct': {
+        category = 'products';
+        action = command.payload.id ? 'product.updated' : 'product.created';
+        entityType = 'product';
+        entityId = typeof result.productId === 'string' ? result.productId : command.payload.id ?? null;
+        summary = `${command.payload.id ? 'Updated' : 'Created'} product ${command.payload.name}`;
+        details = {
+          after: {
+            name: command.payload.name,
+            category: command.payload.category,
+            barcode: command.payload.barcode ?? null,
+            costPrice: command.payload.costPrice,
+            sellingPrice: command.payload.sellingPrice,
+            stockQuantity: command.payload.stockQuantity,
+            unit: command.payload.unit,
+            isActive: command.payload.isActive,
+          },
+        };
+        break;
+      }
+      case 'completeSale': {
+        const sale = await client.query<{ total: number }>(
+          'SELECT total FROM sales WHERE id = $1 AND store_id = $2',
+          [command.payload.saleId, actor.storeId],
+        );
+        const total = sale.rows[0]?.total ?? null;
+        category = 'sales';
+        action = 'sale.completed';
+        entityType = 'sale';
+        entityId = command.payload.saleId;
+        summary = `Completed sale ${command.payload.transactionNumber}${total == null ? '' : ` for ${this.formatMoney(total)}`}`;
+        details = {
+          transactionNumber: command.payload.transactionNumber,
+          total,
+          paymentMethod: command.payload.paymentMethod,
+          customerId: command.payload.customerId,
+          itemCount: command.payload.cart.length,
+          utangPurchase: command.payload.paymentMethod === 'utang',
+        };
+        break;
+      }
+      case 'reviewQrPayment': {
+        category = 'sales';
+        action = command.payload.decision === 'verify' ? 'payment.qrph_verified' : 'payment.qrph_rejected';
+        entityType = 'qr_payment';
+        entityId = command.payload.paymentId;
+        summary = command.payload.decision === 'verify' ? 'Verified a QR Ph payment' : 'Marked a QR Ph payment unpaid';
+        details = { decision: command.payload.decision, note: command.payload.note };
+        break;
+      }
+      case 'adjustStock':
+        category = 'inventory'; action = 'inventory.adjusted'; entityType = 'product'; entityId = command.payload.productId;
+        summary = `Adjusted stock for ${await this.productName(client, actor.storeId, command.payload.productId)}`;
+        details = { newQuantity: command.payload.newQuantity, note: command.payload.note };
+        break;
+      case 'restockProduct':
+        category = 'inventory'; action = 'inventory.restocked'; entityType = 'product'; entityId = command.payload.productId;
+        summary = `Restocked ${await this.productName(client, actor.storeId, command.payload.productId)}`;
+        details = { mode: command.payload.mode, quantity: command.payload.quantity, note: command.payload.note };
+        break;
+      case 'receiveStock':
+        category = 'inventory'; action = 'inventory.restocked'; entityType = 'product'; entityId = command.payload.productId;
+        summary = `Received stock for ${await this.productName(client, actor.storeId, command.payload.productId)}`;
+        details = { productUnitId: command.payload.productUnitId, inputQuantity: command.payload.inputQuantity, note: command.payload.note };
+        break;
+      case 'countStock':
+        category = 'inventory'; action = 'inventory.counted'; entityType = 'product'; entityId = command.payload.productId;
+        summary = `Counted stock for ${await this.productName(client, actor.storeId, command.payload.productId)}`;
+        details = { productUnitId: command.payload.productUnitId, inputQuantity: command.payload.inputQuantity, reason: command.payload.reason, note: command.payload.note };
+        break;
+      case 'adjustStockDelta':
+        category = 'inventory'; action = 'inventory.adjusted'; entityType = 'product'; entityId = command.payload.productId;
+        summary = `Adjusted stock for ${await this.productName(client, actor.storeId, command.payload.productId)}`;
+        details = { productUnitId: command.payload.productUnitId, inputQuantity: command.payload.inputQuantity, reason: command.payload.reason, note: command.payload.note };
+        break;
+      case 'createCustomer':
+        category = 'customers';
+        action = result.message === 'Customer created.' ? 'customer.created' : 'customer.reused';
+        entityType = 'customer';
+        entityId = typeof result.customerId === 'string' ? result.customerId : null;
+        summary = `${action === 'customer.created' ? 'Created' : 'Selected existing'} customer ${command.payload.name}`;
+        details = { name: command.payload.name };
+        break;
+      case 'recordUtangPayment': {
+        const customer = await client.query<{ name: string }>('SELECT name FROM customers WHERE id = $1 AND store_id = $2', [command.payload.customerId, actor.storeId]);
+        category = 'utang'; action = 'utang.payment_recorded'; entityType = 'customer'; entityId = command.payload.customerId;
+        summary = `Recorded ${this.formatMoney(command.payload.amount)} utang payment for ${customer.rows[0]?.name ?? 'customer'}`;
+        details = { amount: command.payload.amount, note: command.payload.note };
+        break;
+      }
+      case 'recordExpense':
+        category = 'expenses'; action = 'expense.recorded'; entityType = 'expense';
+        entityId = typeof result.expenseId === 'string' ? result.expenseId : null;
+        summary = `Recorded ${this.formatMoney(command.payload.amount)} expense for ${command.payload.description}`;
+        details = { category: command.payload.category, description: command.payload.description, amount: command.payload.amount, occurredAt: command.payload.occurredAt };
+        break;
+    }
+
+    await this.activity.record(client, {
+      storeId: actor.storeId,
+      actor,
+      submittedBy: submitter,
+      category,
+      action,
+      entityType,
+      entityId,
+      summary,
+      details,
+      clientCommandId: request.clientCommandId,
+      occurredAt: request.occurredAt ?? ('occurredAt' in command.payload ? command.payload.occurredAt : undefined),
+    });
+  }
+
+  private async productName(client: { query: DatabaseService['query'] }, storeId: string, productId: string) {
+    const product = await client.query<{ name: string }>('SELECT name FROM products WHERE id = $1 AND store_id = $2', [productId, storeId]);
+    return product.rows[0]?.name ?? 'product';
+  }
+
+  private formatMoney(value: number) {
+    return `₱${(value / 100).toFixed(2)}`;
   }
 
   private requireRole(principal: SessionPrincipal, roles: SessionPrincipal['role'][]) {

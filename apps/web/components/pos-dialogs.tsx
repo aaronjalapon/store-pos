@@ -11,8 +11,13 @@ function formatQuantity(value: number) {
   return new Intl.NumberFormat('en-PH', { maximumFractionDigits: 6 }).format(value);
 }
 
-export function StockAdjustmentModal({ product, onClose, onSave }: { product: Product; onClose: () => void; onSave: (quantity: number) => Promise<void> }) {
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+export function StockAdjustmentModal({ product, onClose, onSave }: { product: Product; onClose: () => void; onSave: (quantity: number, password: string) => Promise<unknown> }) {
   const [quantity, setQuantity] = useState(String(product.stockQuantity));
+  const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const parsed = Number(quantity);
@@ -23,7 +28,7 @@ export function StockAdjustmentModal({ product, onClose, onSave }: { product: Pr
     : Number.isInteger(parsed));
   const delta = valid ? parsed - product.stockQuantity : 0;
   const help = product.soldByWeight ? `Use increments of ${step} ${product.unit}.` : 'Use a whole number.';
-  return <AppModal title={`Adjust ${product.name}`} description={`Currently ${product.stockQuantity} ${product.unit} in stock. ${help}`} onClose={busy ? () => undefined : onClose}><form className="modal-form" onSubmit={async (event) => { event.preventDefault(); if (!valid) { setError(product.soldByWeight ? `Enter zero or more using ${step} ${product.unit} increments` : 'Enter a whole stock quantity of zero or more'); return; } setBusy(true); setError(''); try { await onSave(parsed); onClose(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not adjust stock'); setBusy(false); } }}><label>New stock quantity<input data-autofocus value={quantity} onChange={(event) => setQuantity(event.target.value)} type="number" min="0" step={step} inputMode={product.soldByWeight ? 'decimal' : 'numeric'} required /></label><div className="stock-preview"><span>Change</span><strong className={delta < 0 ? 'negative' : ''}>{delta > 0 ? '+' : ''}{delta} {product.unit}</strong></div>{error && <p className="form-message error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !valid}>{busy ? 'Saving…' : 'Save quantity'}</button></div></form></AppModal>;
+  return <AppModal title={`Adjust ${product.name}`} description={`Currently ${product.stockQuantity} ${product.unit} in stock. ${help}`} onClose={busy ? () => undefined : onClose}><form className="modal-form" onSubmit={async (event) => { event.preventDefault(); if (!valid) { setError(product.soldByWeight ? `Enter zero or more using ${step} ${product.unit} increments` : 'Enter a whole stock quantity of zero or more'); return; } if (!password) { setError('Enter your password to approve this stock adjustment'); return; } setBusy(true); setError(''); try { await onSave(parsed, password); onClose(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not adjust stock'); setBusy(false); } }}><label>New stock quantity<input data-autofocus value={quantity} onChange={(event) => setQuantity(event.target.value)} type="number" min="0" step={step} inputMode={product.soldByWeight ? 'decimal' : 'numeric'} required /></label><div className="stock-preview"><span>Change</span><strong className={delta < 0 ? 'negative' : ''}>{delta > 0 ? '+' : ''}{delta} {product.unit}</strong></div><label>Confirm your password<input aria-describedby="stock-adjustment-password-help" value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required /></label><small id="stock-adjustment-password-help" className="muted">For security, stock adjustments require an online password check.</small>{error && <p className="form-message error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !valid || !password}>{busy ? 'Verifying…' : 'Verify & save quantity'}</button></div></form></AppModal>;
 }
 
 function legacyDisplayMultiplier(product: Product) {
@@ -44,7 +49,7 @@ export function QuickRestockModal({
   onClose: () => void;
   onSave: (mode: RestockMode, quantity: number, unit: ProductUnit | null) => Promise<void>;
 }) {
-  const restockUnits = units.filter((unit) => unit.productId === product.id && unit.isActive && unit.canRestock);
+  const restockUnits = units.filter((unit) => unit.productId === product.id && unit.isActive && unit.canRestock && isUuid(unit.id));
   const initialUnit = restockUnits.find((unit) => unit.id === initialUnitId)
     ?? restockUnits.find((unit) => unit.id === product.defaultRestockUnitId)
     ?? restockUnits.find((unit) => unit.id === product.displayUnitId)

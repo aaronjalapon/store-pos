@@ -18,7 +18,7 @@ import {
   type CreateStaffRequest,
   type ResetStaffSecretRequest,
 } from '@gma/contracts';
-import type { FastifyRequest } from 'fastify';
+import type { Request } from 'express';
 import { AuthService } from '../auth/auth.service';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
@@ -31,14 +31,14 @@ export class StaffController {
   constructor(private readonly auth: AuthService) {}
 
   @Get()
-  list(@Req() request: FastifyRequest, @Param('storeId', new ParseUUIDPipe()) storeId: string) {
+  list(@Req() request: Request, @Param('storeId', new ParseUUIDPipe()) storeId: string) {
     this.assertStoreScope(request, storeId);
     return this.auth.listStaff(storeId, request.principal!).then((staff) => ({ staff }));
   }
 
   @Post()
   create(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Body() body: CreateStaffRequest,
   ) {
@@ -50,7 +50,7 @@ export class StaffController {
 
   @Patch(':userId/disable')
   disable(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Param('userId', new ParseUUIDPipe()) userId: string,
   ) {
@@ -60,7 +60,7 @@ export class StaffController {
 
   @Patch(':userId/reset-secret')
   resetSecret(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Param('userId', new ParseUUIDPipe()) userId: string,
     @Body() body: ResetStaffSecretRequest,
@@ -71,7 +71,7 @@ export class StaffController {
     return this.auth.resetStaffSecret(storeId, request.principal!, userId, result.data).then((staff) => ({ staff }));
   }
 
-  private assertStoreScope(request: FastifyRequest, storeId: string) {
+  private assertStoreScope(request: Request, storeId: string) {
     if (request.principal?.storeId !== storeId) throw new ForbiddenException('You do not have access to this store');
   }
 }

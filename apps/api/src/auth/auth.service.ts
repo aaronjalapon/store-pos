@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -12,6 +13,8 @@ import type {
   AuthSession,
   CashierLoginRequest,
   DeviceInfo,
+  ManagerActionConfirmationRequest,
+  ManagerActionConfirmationResponse,
   OwnerLoginRequest,
   Role,
   SessionUser,
@@ -26,6 +29,7 @@ import type {
 import { DatabaseService } from '../database/database.service';
 import { hashSecret, verifySecret } from './crypto';
 import type { SessionPrincipal } from './auth.types';
+import { ActivityService } from '../activity/activity.service';
 
 interface MembershipRow {
   user_id: string;
@@ -69,6 +73,7 @@ export class AuthService {
     private readonly config: ConfigService,
     private readonly jwt: JwtService,
     private readonly database: DatabaseService,
+    @Optional() private readonly activity?: ActivityService,
   ) {}
 
   async getSetupStatus() {
@@ -123,7 +128,7 @@ export class AuthService {
         deviceName: input.deviceName.trim(),
         registeredByUserId: userId,
       });
-      return {
+      const principal = {
         userId,
         storeId,
         role: 'owner',
@@ -131,7 +136,18 @@ export class AuthService {
         displayName: input.displayName.trim(),
         email: input.email.toLowerCase(),
         staffCode: null,
-      };
+      } satisfies SessionPrincipal;
+      await this.activity?.record(client, {
+        storeId,
+        actor: principal,
+        category: 'auth',
+        action: 'auth.signed_in',
+        entityType: 'user',
+        entityId: userId,
+        summary: `${principal.displayName} signed in as owner`,
+        details: { method: 'initial_setup' },
+      });
+      return principal;
     });
     return this.issueSession(principal);
   }
@@ -152,15 +168,7 @@ export class AuthService {
     }
     if (!membership.store_active) throw new UnauthorizedException('This store is suspended');
     if (!membership.user_active || !membership.membership_active) throw new UnauthorizedException('Your account is inactive');
-    await this.database.transaction(async (client) => {
-      await this.upsertDevice(client, {
-        deviceId: input.deviceId,
-        storeId: membership.store_id,
-        deviceName: input.deviceName.trim(),
-        registeredByUserId: membership.user_id,
-      });
-    });
-    return this.issueSession({
+    const principal: SessionPrincipal & { role: StoreRole } = {
       userId: membership.user_id,
       storeId: membership.store_id,
       role: membership.role,
@@ -168,7 +176,26 @@ export class AuthService {
       displayName: membership.display_name,
       email: membership.email,
       staffCode: membership.staff_code,
+    };
+    await this.database.transaction(async (client) => {
+      await this.upsertDevice(client, {
+        deviceId: input.deviceId,
+        storeId: membership.store_id,
+        deviceName: input.deviceName.trim(),
+        registeredByUserId: membership.user_id,
+      });
+      await this.activity?.record(client, {
+        storeId: membership.store_id,
+        actor: principal,
+        category: 'auth',
+        action: 'auth.signed_in',
+        entityType: 'user',
+        entityId: membership.user_id,
+        summary: `${membership.display_name} signed in as ${membership.role}`,
+        details: { method: 'password' },
+      });
     });
+    return this.issueSession(principal);
   }
 
   async loginCashier(input: CashierLoginRequest) {
@@ -178,6 +205,15 @@ export class AuthService {
     }
     if (!membership.store_active) throw new UnauthorizedException('This store is suspended');
     if (!membership.user_active || !membership.membership_active) throw new UnauthorizedException('This cashier account is inactive');
+    const principal: SessionPrincipal & { role: 'cashier' } = {
+      userId: membership.user_id,
+      storeId: membership.store_id,
+      role: 'cashier',
+      deviceId: input.deviceId,
+      displayName: membership.display_name,
+      email: membership.email,
+      staffCode: membership.staff_code,
+    };
     await this.database.transaction(async (client) => {
       await this.upsertDevice(client, {
         deviceId: input.deviceId,
@@ -185,16 +221,18 @@ export class AuthService {
         deviceName: input.deviceName.trim(),
         registeredByUserId: membership.user_id,
       });
+      await this.activity?.record(client, {
+        storeId: membership.store_id,
+        actor: principal,
+        category: 'auth',
+        action: 'auth.signed_in',
+        entityType: 'user',
+        entityId: membership.user_id,
+        summary: `${membership.display_name} signed in as cashier`,
+        details: { method: 'pin' },
+      });
     });
-    return this.issueSession({
-      userId: membership.user_id,
-      storeId: membership.store_id,
-      role: membership.role,
-      deviceId: input.deviceId,
-      displayName: membership.display_name,
-      email: membership.email,
-      staffCode: membership.staff_code,
-    });
+    return this.issueSession(principal);
   }
 
   async verify(token: string): Promise<SessionPrincipal> {
@@ -293,6 +331,80 @@ export class AuthService {
     };
   }
 
+  async logout(principal: SessionPrincipal) {
+    if (principal.storeId && principal.role !== 'superadmin') {
+      await this.activity?.recordNow({
+        storeId: principal.storeId,
+        actor: principal,
+        category: 'auth',
+        action: 'auth.signed_out',
+        entityType: 'user',
+        entityId: principal.userId,
+        summary: `${principal.displayName} signed out`,
+      });
+    }
+    return { loggedOut: true as const };
+  }
+
+  async confirmManagerAction(
+    principal: SessionPrincipal,
+    input: ManagerActionConfirmationRequest,
+  ): Promise<ManagerActionConfirmationResponse> {
+    if (!isManagerRole(principal.role)) throw new ForbiddenException('Only an owner or admin can approve stock adjustments');
+    const membership = await this.findMembershipById(principal.userId, principal.storeId);
+    if (!membership?.password_hash || !verifySecret(input.password, membership.password_hash)) {
+      throw new UnauthorizedException('Password is incorrect');
+    }
+    const proof = await this.jwt.signAsync(
+      {
+        sub: principal.userId,
+        storeId: principal.storeId,
+        deviceId: principal.deviceId,
+        action: input.action,
+        clientCommandId: input.clientCommandId,
+      },
+      {
+        secret: this.config.getOrThrow<string>('JWT_SECRET'),
+        issuer: 'gma-pos-api',
+        audience: 'gma-manager-action',
+        expiresIn: '2m',
+      },
+    );
+    return { proof };
+  }
+
+  async verifyManagerActionProof(
+    principal: SessionPrincipal,
+    proof: string | undefined,
+    action: ManagerActionConfirmationRequest['action'],
+    clientCommandId: string,
+  ) {
+    if (!isManagerRole(principal.role)) throw new ForbiddenException('Only an owner or admin can adjust stock');
+    if (!proof) throw new ForbiddenException('Enter your password to approve this stock adjustment');
+    try {
+      const payload = await this.jwt.verifyAsync<{
+        sub: string;
+        storeId: string;
+        deviceId: string;
+        action: ManagerActionConfirmationRequest['action'];
+        clientCommandId: string;
+      }>(proof, {
+        secret: this.config.getOrThrow<string>('JWT_SECRET'),
+        issuer: 'gma-pos-api',
+        audience: 'gma-manager-action',
+      });
+      if (
+        payload.sub !== principal.userId
+        || payload.storeId !== principal.storeId
+        || payload.deviceId !== principal.deviceId
+        || payload.action !== action
+        || payload.clientCommandId !== clientCommandId
+      ) throw new Error('Approval does not match this adjustment');
+    } catch {
+      throw new ForbiddenException('Password approval expired or does not match this stock adjustment');
+    }
+  }
+
   async listSuperadminStores(): Promise<SuperadminStoreSummary[]> {
     const result = await this.database.query<{
       id: string;
@@ -329,19 +441,80 @@ export class AuthService {
     };
   }
 
-  async setSuperadminStoreStatus(storeId: string, isActive: boolean) {
-    const result = await this.database.query<{ id: string }>(
-      'UPDATE stores SET is_active = $2, updated_at = now() WHERE id = $1 RETURNING id',
-      [storeId, isActive],
-    );
-    if (!result.rows[0]) throw new NotFoundException('Store not found');
+  async setSuperadminStoreStatus(storeId: string, isActive: boolean, actor?: SessionPrincipal) {
+    await this.database.transaction(async (client) => {
+      const store = await client.query<{ id: string; name: string; is_active: boolean }>('SELECT id, name, is_active FROM stores WHERE id = $1 FOR UPDATE', [storeId]);
+      if (!store.rows[0]) throw new NotFoundException('Store not found');
+      await client.query('UPDATE stores SET is_active = $2, updated_at = now() WHERE id = $1', [storeId, isActive]);
+      if (actor) await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'store',
+        action: isActive ? 'store.reactivated' : 'store.suspended',
+        entityType: 'store',
+        entityId: storeId,
+        summary: `${isActive ? 'Reactivated' : 'Suspended'} store ${store.rows[0].name}`,
+        details: { before: { isActive: store.rows[0].is_active }, after: { isActive } },
+      });
+    });
     return this.getSuperadminStoreDetails(storeId);
   }
 
-  async setSuperadminStaffStatus(storeId: string, userId: string, isActive: boolean) {
+  async deleteStoreAsSuperadmin(storeId: string) {
+    return this.database.transaction(async (client) => {
+      const store = await client.query<{ id: string; is_active: boolean }>(
+        'SELECT id, is_active FROM stores WHERE id = $1 FOR UPDATE',
+        [storeId],
+      );
+      if (!store.rows[0]) throw new NotFoundException('Store not found');
+      if (store.rows[0].is_active) {
+        throw new ConflictException('Disable the store before deleting it');
+      }
+
+      const operationalData = await client.query<{ count: string }>(
+        `SELECT (
+           (SELECT COUNT(*) FROM products WHERE store_id = $1) +
+           (SELECT COUNT(*) FROM customers WHERE store_id = $1) +
+           (SELECT COUNT(*) FROM sales WHERE store_id = $1) +
+           (SELECT COUNT(*) FROM expenses WHERE store_id = $1) +
+           (SELECT COUNT(*) FROM backups WHERE store_id = $1) +
+           (SELECT COUNT(*) FROM devices WHERE store_id = $1)
+         )::text AS count`,
+        [storeId],
+      );
+      if (Number(operationalData.rows[0]?.count ?? '0') > 0) {
+        throw new ConflictException('Only an empty store can be deleted');
+      }
+
+      const memberships = await client.query<{ user_id: string }>(
+        'SELECT user_id FROM store_memberships WHERE store_id = $1',
+        [storeId],
+      );
+      const userIds = memberships.rows.map((row) => row.user_id);
+
+      await client.query('DELETE FROM stores WHERE id = $1', [storeId]);
+      if (userIds.length > 0) {
+        await client.query(
+          `DELETE FROM users
+            WHERE id = ANY($1::uuid[])
+              AND is_superadmin = false
+              AND NOT EXISTS (
+                SELECT 1 FROM store_memberships WHERE store_memberships.user_id = users.id
+              )`,
+          [userIds],
+        );
+      }
+
+      return { deleted: true as const, storeId };
+    });
+  }
+
+  async setSuperadminStaffStatus(storeId: string, userId: string, isActive: boolean, actor?: SessionPrincipal) {
     await this.database.transaction(async (client) => {
-      const membership = await client.query<{ role: Role; is_active: boolean }>(
-        'SELECT role, is_active FROM store_memberships WHERE store_id = $1 AND user_id = $2',
+      const membership = await client.query<{ role: Role; is_active: boolean; display_name: string }>(
+        `SELECT store_memberships.role, store_memberships.is_active, users.display_name
+           FROM store_memberships JOIN users ON users.id = store_memberships.user_id
+          WHERE store_memberships.store_id = $1 AND store_memberships.user_id = $2`,
         [storeId, userId],
       );
       if (!membership.rows[0]) throw new NotFoundException('Staff account not found');
@@ -367,14 +540,26 @@ export class AuthService {
         await client.query('UPDATE users SET is_active = true, updated_at = now() WHERE id = $1', [userId]);
       }
       await client.query('UPDATE stores SET updated_at = now() WHERE id = $1', [storeId]);
+      if (actor) await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'staff',
+        action: isActive ? 'staff.reactivated' : 'staff.disabled',
+        entityType: 'user',
+        entityId: userId,
+        summary: `${isActive ? 'Reactivated' : 'Disabled'} ${membership.rows[0].display_name}'s ${membership.rows[0].role} access`,
+        details: { targetDisplayName: membership.rows[0].display_name, targetRole: membership.rows[0].role, before: { isActive: membership.rows[0].is_active }, after: { isActive } },
+      });
     });
     return this.getSuperadminStoreDetails(storeId);
   }
 
-  async resetSuperadminStaffSecret(storeId: string, userId: string, password: string) {
+  async resetSuperadminStaffSecret(storeId: string, userId: string, password: string, actor?: SessionPrincipal) {
     await this.database.transaction(async (client) => {
-      const membership = await client.query<{ role: Role }>(
-        'SELECT role FROM store_memberships WHERE store_id = $1 AND user_id = $2',
+      const membership = await client.query<{ role: Role; display_name: string }>(
+        `SELECT store_memberships.role, users.display_name
+           FROM store_memberships JOIN users ON users.id = store_memberships.user_id
+          WHERE store_memberships.store_id = $1 AND store_memberships.user_id = $2`,
         [storeId, userId],
       );
       if (!membership.rows[0]) throw new NotFoundException('Staff account not found');
@@ -383,6 +568,16 @@ export class AuthService {
       }
       await client.query('UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2', [hashSecret(password), userId]);
       await client.query('UPDATE stores SET updated_at = now() WHERE id = $1', [storeId]);
+      if (actor) await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'staff',
+        action: 'staff.credential_reset',
+        entityType: 'user',
+        entityId: userId,
+        summary: `Reset ${membership.rows[0].display_name}'s password`,
+        details: { targetDisplayName: membership.rows[0].display_name, targetRole: membership.rows[0].role, credentialType: 'password' },
+      });
     });
     return this.getSuperadminStoreDetails(storeId);
   }
@@ -410,7 +605,7 @@ export class AuthService {
     return result.rows.map((row) => this.mapStaff(row));
   }
 
-  async createStoreAsSuperadmin(input: SuperadminCreateStoreRequest) {
+  async createStoreAsSuperadmin(input: SuperadminCreateStoreRequest, actor?: SessionPrincipal) {
     const result = await this.database.transaction(async (client) => {
       const now = new Date();
       const storeId = crypto.randomUUID();
@@ -431,6 +626,16 @@ export class AuthService {
         [storeId, userId, now],
       );
       await client.query('INSERT INTO sync_events (store_id, kind) VALUES ($1, $2)', [storeId, 'staff']);
+      if (actor) await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'store',
+        action: 'store.created',
+        entityType: 'store',
+        entityId: storeId,
+        summary: `Created store ${input.storeName.trim()}`,
+        details: { ownerDisplayName: input.ownerDisplayName.trim() },
+      });
       return { storeId, userId };
     });
     return {
@@ -439,7 +644,7 @@ export class AuthService {
     };
   }
 
-  async createStoreStaffAsSuperadmin(storeId: string, input: SuperadminStaffInput) {
+  async createStoreStaffAsSuperadmin(storeId: string, input: SuperadminStaffInput, actor?: SessionPrincipal) {
     const userId = await this.database.transaction(async (client) => {
       const userId = crypto.randomUUID();
       const now = new Date();
@@ -455,6 +660,16 @@ export class AuthService {
       );
       await client.query('UPDATE stores SET updated_at = now() WHERE id = $1', [storeId]);
       await client.query('INSERT INTO sync_events (store_id, kind) VALUES ($1, $2)', [storeId, 'staff']);
+      if (actor) await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'staff',
+        action: 'staff.created',
+        entityType: 'user',
+        entityId: userId,
+        summary: `Created ${input.role} account for ${input.displayName.trim()}`,
+        details: { targetDisplayName: input.displayName.trim(), targetRole: input.role },
+      });
       return userId;
     });
     return {
@@ -494,6 +709,16 @@ export class AuthService {
         [storeId, userId, input.role, now],
       );
       await this.touchStore(client, storeId, actor.userId);
+      await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'staff',
+        action: 'staff.created',
+        entityType: 'user',
+        entityId: userId,
+        summary: `Created ${input.role} account for ${input.displayName.trim()}`,
+        details: { targetDisplayName: input.displayName.trim(), targetRole: input.role },
+      });
       return userId;
     });
     return this.getStaffMember(storeId, userId);
@@ -527,8 +752,10 @@ export class AuthService {
     this.requireManager(actor);
     if (actor.userId === userId) throw new ConflictException('You cannot disable your own account');
     await this.database.transaction(async (client) => {
-      const membership = await client.query<{ role: Role }>(
-        'SELECT role FROM store_memberships WHERE store_id = $1 AND user_id = $2',
+      const membership = await client.query<{ role: Role; display_name: string }>(
+        `SELECT store_memberships.role, users.display_name
+           FROM store_memberships JOIN users ON users.id = store_memberships.user_id
+          WHERE store_memberships.store_id = $1 AND store_memberships.user_id = $2`,
         [storeId, userId],
       );
       if (!membership.rows[0]) throw new NotFoundException('Staff account not found');
@@ -536,6 +763,16 @@ export class AuthService {
       await client.query('UPDATE store_memberships SET is_active = false, updated_at = now() WHERE store_id = $1 AND user_id = $2', [storeId, userId]);
       await client.query('UPDATE users SET is_active = false, updated_at = now() WHERE id = $1', [userId]);
       await this.touchStore(client, storeId, actor.userId);
+      await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'staff',
+        action: 'staff.disabled',
+        entityType: 'user',
+        entityId: userId,
+        summary: `Disabled ${membership.rows[0].display_name}'s ${membership.rows[0].role} access`,
+        details: { targetDisplayName: membership.rows[0].display_name, targetRole: membership.rows[0].role, before: { isActive: true }, after: { isActive: false } },
+      });
     });
     return this.getStaffMember(storeId, userId);
   }
@@ -543,8 +780,10 @@ export class AuthService {
   async resetStaffSecret(storeId: string, actor: SessionPrincipal, userId: string, input: { password?: string; pin?: string }) {
     this.requireManager(actor);
     await this.database.transaction(async (client) => {
-      const membership = await client.query<{ role: Role }>(
-        'SELECT role FROM store_memberships WHERE store_id = $1 AND user_id = $2',
+      const membership = await client.query<{ role: Role; display_name: string }>(
+        `SELECT store_memberships.role, users.display_name
+           FROM store_memberships JOIN users ON users.id = store_memberships.user_id
+          WHERE store_memberships.store_id = $1 AND store_memberships.user_id = $2`,
         [storeId, userId],
       );
       if (!membership.rows[0]) throw new NotFoundException('Staff account not found');
@@ -557,6 +796,16 @@ export class AuthService {
         await client.query('UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2', [hashSecret(input.password), userId]);
       }
       await this.touchStore(client, storeId, actor.userId);
+      await this.activity?.record(client, {
+        storeId,
+        actor,
+        category: 'staff',
+        action: 'staff.credential_reset',
+        entityType: 'user',
+        entityId: userId,
+        summary: `Reset ${membership.rows[0].display_name}'s ${role === 'cashier' ? 'PIN' : 'password'}`,
+        details: { targetDisplayName: membership.rows[0].display_name, targetRole: role, credentialType: role === 'cashier' ? 'pin' : 'password' },
+      });
     });
     return this.getStaffMember(storeId, userId);
   }

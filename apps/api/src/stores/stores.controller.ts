@@ -11,7 +11,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { StoreSnapshot } from '@gma/contracts';
-import type { FastifyRequest } from 'fastify';
+import type { Request } from 'express';
 import { SessionAuthGuard } from '../auth/session-auth.guard';
 import { StoresService } from './stores.service';
 
@@ -22,7 +22,7 @@ export class StoresController {
 
   @Get('bootstrap')
   bootstrap(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Headers('authorization') authorization: string,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
   ) {
@@ -32,7 +32,7 @@ export class StoresController {
 
   @Get('sync')
   sync(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
   ) {
     this.assertStoreScope(request, storeId);
@@ -41,7 +41,7 @@ export class StoresController {
 
   @Post('import-legacy')
   importLegacy(
-    @Req() request: FastifyRequest,
+    @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Body() body: { snapshot: StoreSnapshot },
   ) {
@@ -49,7 +49,7 @@ export class StoresController {
     return this.stores.importLegacy(request.principal!, body.snapshot);
   }
 
-  private assertStoreScope(request: FastifyRequest, storeId: string) {
+  private assertStoreScope(request: Request, storeId: string) {
     if (request.principal?.storeId !== storeId) throw new ForbiddenException('You do not have access to this store');
   }
 }

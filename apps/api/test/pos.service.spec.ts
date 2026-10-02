@@ -78,6 +78,51 @@ describe('PosService command idempotency', () => {
   });
 });
 
+describe('PosService protected stock adjustment', () => {
+  const request = {
+    clientCommandId: '00000000-0000-4000-8000-000000000061',
+    baseCursor: 0,
+    managerApprovalProof: 'manager-proof',
+    command: {
+      type: 'adjustStock' as const,
+      payload: {
+        productId: '00000000-0000-4000-8000-000000000062',
+        newQuantity: 12,
+        note: 'Manual stock adjustment',
+        expectedVersion: 1,
+      },
+    },
+  } satisfies StoreCommandRequest;
+
+  it('rejects a cashier before processing or checking a password proof', async () => {
+    const database = { query: jest.fn() };
+    const auth = { verifyManagerActionProof: jest.fn() };
+    const service = new PosService(database as never, {} as never, auth as never);
+
+    await expect(service.applyCommand(principal, request)).rejects.toThrow('You do not have access to this action');
+    expect(auth.verifyManagerActionProof).not.toHaveBeenCalled();
+    expect(database.query).not.toHaveBeenCalled();
+  });
+
+  it('requires a command-bound manager approval before touching stock', async () => {
+    const database = { query: jest.fn().mockResolvedValue({ rows: [{ first_synced_at: null }] }) };
+    const data = {
+      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      currentCursor: jest.fn().mockResolvedValue(0),
+    };
+    const auth = { verifyManagerActionProof: jest.fn().mockResolvedValue(undefined) };
+    const service = new PosService(database as never, data as never, auth as never);
+
+    await service.applyCommand(ownerPrincipal, request);
+    expect(auth.verifyManagerActionProof).toHaveBeenCalledWith(
+      ownerPrincipal,
+      'manager-proof',
+      'adjust_stock',
+      request.clientCommandId,
+    );
+  });
+});
+
 describe('PosService product persistence', () => {
   it('creates a canonical product with required base inventory values and a type-safe barcode check', async () => {
     const client = {

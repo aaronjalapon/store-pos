@@ -10,13 +10,15 @@ import {
 } from '@nestjs/common';
 import {
   cashierLoginSchema,
+  managerActionConfirmationSchema,
   ownerLoginSchema,
   setupOwnerSchema,
   type CashierLoginRequest,
+  type ManagerActionConfirmationRequest,
   type OwnerLoginRequest,
   type SetupOwnerRequest,
 } from '@gma/contracts';
-import type { FastifyRequest } from 'fastify';
+import type { Request } from 'express';
 import { AuthService } from './auth.service';
 import { SessionAuthGuard } from './session-auth.guard';
 
@@ -52,13 +54,21 @@ export class AuthController {
 
   @Post('logout')
   @UseGuards(SessionAuthGuard)
-  logout() {
-    return { loggedOut: true as const };
+  logout(@Req() request: Request) {
+    return this.auth.logout(request.principal!);
+  }
+
+  @Post('confirm-manager-action')
+  @UseGuards(SessionAuthGuard)
+  confirmManagerAction(@Req() request: Request, @Body() body: ManagerActionConfirmationRequest) {
+    const result = managerActionConfirmationSchema.safeParse(body);
+    if (!result.success) throw new BadRequestException(result.error.flatten());
+    return this.auth.confirmManagerAction(request.principal!, result.data);
   }
 
   @Get('me')
   @UseGuards(SessionAuthGuard)
-  me(@Req() request: FastifyRequest, @Headers('authorization') authorization: string) {
+  me(@Req() request: Request, @Headers('authorization') authorization: string) {
     return this.auth.buildSession(request.principal!, authorization.slice(7));
   }
 }

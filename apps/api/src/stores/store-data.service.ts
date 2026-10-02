@@ -5,6 +5,8 @@ import type {
   InventoryMovement,
   Product,
   ProductUnit,
+  QrPayment,
+  QrPhPaymentSettings,
   Sale,
   SaleItem,
   StaffMember,
@@ -79,6 +81,36 @@ interface SaleRow {
   change_amount: number | null;
   record_version: number;
   created_at: Date;
+  updated_at: Date;
+}
+
+interface QrPaymentRow {
+  id: string;
+  store_id: string;
+  sale_id: string;
+  cashier_user_id: string;
+  cashier_display_name_snapshot: string;
+  device_id: string;
+  amount: number;
+  reference: string;
+  normalized_reference: string;
+  confirmation_source: QrPayment['confirmationSource'];
+  status: QrPayment['status'];
+  attention_reason: QrPayment['attentionReason'];
+  confirmed_at: Date;
+  reviewed_at: Date | null;
+  reviewed_by_user_id: string | null;
+  review_note: string | null;
+  record_version: number;
+  created_at: Date;
+  updated_at: Date;
+}
+
+interface QrPhPaymentSettingsRow {
+  store_id: string;
+  image_revision: string;
+  content_type: QrPhPaymentSettings['contentType'];
+  byte_length: number;
   updated_at: Date;
 }
 
@@ -184,7 +216,7 @@ export class StoreDataService {
   constructor(private readonly database: DatabaseService) {}
 
   async loadSnapshot(storeId: string): Promise<StoreSnapshot> {
-    const [products, productUnits, sales, saleItems, inventoryMovements, customers, utangEntries, expenses, staff] = await Promise.all([
+    const [products, productUnits, sales, saleItems, inventoryMovements, customers, utangEntries, expenses, staff, qrPayments, paymentSettings] = await Promise.all([
       this.database.query<ProductRow>('SELECT * FROM products WHERE store_id = $1 ORDER BY updated_at ASC, id ASC', [storeId]),
       this.database.query<ProductUnitRow>('SELECT * FROM product_units WHERE store_id = $1 AND is_active = true ORDER BY product_id ASC, multiplier_base_units ASC, id ASC', [storeId]),
       this.database.query<SaleRow>('SELECT * FROM sales WHERE store_id = $1 ORDER BY created_at ASC, id ASC', [storeId]),
@@ -203,6 +235,8 @@ export class StoreDataService {
           ORDER BY CASE store_memberships.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, users.display_name ASC`,
         [storeId],
       ),
+      this.database.query<QrPaymentRow>('SELECT * FROM qr_payments WHERE store_id = $1 ORDER BY confirmed_at ASC, id ASC', [storeId]),
+      this.database.query<QrPhPaymentSettingsRow>('SELECT store_id, image_revision, content_type, byte_length, updated_at FROM qrph_payment_settings WHERE store_id = $1', [storeId]),
     ]);
 
     return {
@@ -215,6 +249,8 @@ export class StoreDataService {
       utangEntries: utangEntries.rows.map((row) => this.mapUtangEntry(row)),
       expenses: expenses.rows.map((row) => this.mapExpense(row)),
       staff: staff.rows.map((row) => this.mapStaff(row)),
+      qrPayments: qrPayments.rows.map((row) => this.mapQrPayment(row)),
+      paymentSettings: paymentSettings.rows[0] ? this.mapPaymentSettings(paymentSettings.rows[0]) : null,
     };
   }
 
@@ -314,6 +350,40 @@ export class StoreDataService {
       changeAmount: row.change_amount,
       recordVersion: row.record_version,
       createdAt: row.created_at.toISOString(),
+      updatedAt: row.updated_at.toISOString(),
+    };
+  }
+
+  private mapQrPayment(row: QrPaymentRow): QrPayment {
+    return {
+      id: row.id,
+      storeId: row.store_id,
+      saleId: row.sale_id,
+      cashierUserId: row.cashier_user_id,
+      cashierDisplayNameSnapshot: row.cashier_display_name_snapshot,
+      deviceId: row.device_id,
+      amount: row.amount,
+      reference: row.reference,
+      normalizedReference: row.normalized_reference,
+      confirmationSource: row.confirmation_source,
+      status: row.status,
+      attentionReason: row.attention_reason,
+      confirmedAt: row.confirmed_at.toISOString(),
+      reviewedAt: row.reviewed_at?.toISOString() ?? null,
+      reviewedByUserId: row.reviewed_by_user_id,
+      reviewNote: row.review_note,
+      recordVersion: row.record_version,
+      createdAt: row.created_at.toISOString(),
+      updatedAt: row.updated_at.toISOString(),
+    };
+  }
+
+  private mapPaymentSettings(row: QrPhPaymentSettingsRow): QrPhPaymentSettings {
+    return {
+      storeId: row.store_id,
+      imageRevision: row.image_revision,
+      contentType: row.content_type,
+      byteLength: row.byte_length,
       updatedAt: row.updated_at.toISOString(),
     };
   }

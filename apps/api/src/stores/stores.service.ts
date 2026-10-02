@@ -1,9 +1,10 @@
-import { ConflictException, ForbiddenException, Injectable } from '@nestjs/common';
+import { ConflictException, ForbiddenException, Injectable, Optional } from '@nestjs/common';
 import type { StoreBootstrapResponse, StoreSnapshot, StoreSyncResponse } from '@gma/contracts';
 import { DatabaseService } from '../database/database.service';
 import { AuthService } from '../auth/auth.service';
 import type { SessionPrincipal } from '../auth/auth.types';
 import { StoreDataService } from './store-data.service';
+import { ActivityService } from '../activity/activity.service';
 
 @Injectable()
 export class StoresService {
@@ -11,6 +12,7 @@ export class StoresService {
     private readonly auth: AuthService,
     private readonly data: StoreDataService,
     private readonly database: DatabaseService,
+    @Optional() private readonly activity?: ActivityService,
   ) {}
 
   async bootstrap(principal: SessionPrincipal, token: string): Promise<StoreBootstrapResponse> {
@@ -93,6 +95,19 @@ export class StoresService {
           [sale.id, principal.storeId, sale.transactionNumber, sale.customerId, principal.userId, principal.deviceId, sale.subtotal, sale.discount, sale.total, sale.paymentMethod, sale.cashReceived, sale.changeAmount, sale.recordVersion, sale.createdAt, sale.updatedAt],
         );
       }
+      for (const payment of snapshot.qrPayments ?? []) {
+        await client.query(
+          `INSERT INTO qr_payments
+           (id, store_id, sale_id, cashier_user_id, cashier_display_name_snapshot, device_id, amount, reference, normalized_reference,
+            confirmation_source, status, attention_reason, confirmed_at, reviewed_at, reviewed_by_user_id,
+            review_note, record_version, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+          [payment.id, principal.storeId, payment.saleId, principal.userId, payment.cashierDisplayNameSnapshot, principal.deviceId, payment.amount,
+            payment.reference, payment.normalizedReference, payment.confirmationSource, payment.status,
+            payment.attentionReason, payment.confirmedAt, payment.reviewedAt, payment.reviewedByUserId ? principal.userId : null,
+            payment.reviewNote, payment.recordVersion, payment.createdAt, payment.updatedAt],
+        );
+      }
       for (const item of snapshot.saleItems) {
         await client.query(
           `INSERT INTO sale_items
@@ -126,6 +141,21 @@ export class StoresService {
         );
       }
       await this.data.createSyncEvent(client, principal.storeId, 'legacy_import');
+      await this.activity?.record(client, {
+        storeId: principal.storeId,
+        actor: principal,
+        category: 'data',
+        action: 'data.legacy_imported',
+        entityType: 'store',
+        entityId: principal.storeId,
+        summary: 'Imported legacy store data',
+        details: {
+          products: snapshot.products.length,
+          sales: snapshot.sales.length,
+          customers: snapshot.customers.length,
+          expenses: snapshot.expenses.length,
+        },
+      });
     });
     return this.sync(principal);
   }

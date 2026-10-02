@@ -1,7 +1,25 @@
 'use client';
 
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
+
+const modalStack: string[] = [];
+let previousBodyOverflow = '';
+
+function updateModalLayers() {
+  const topModalId = modalStack.at(-1);
+  document.querySelectorAll<HTMLElement>('[data-modal-layer]').forEach((layer) => {
+    const isTopLayer = layer.dataset.modalLayer === topModalId;
+    layer.toggleAttribute('inert', !isTopLayer);
+    if (isTopLayer) layer.removeAttribute('aria-hidden');
+    else layer.setAttribute('aria-hidden', 'true');
+  });
+  const appRoot = document.querySelector<HTMLElement>('[data-app-root]');
+  appRoot?.toggleAttribute('inert', modalStack.length > 0);
+  if (modalStack.length > 0) appRoot?.setAttribute('aria-hidden', 'true');
+  else appRoot?.removeAttribute('aria-hidden');
+}
 
 interface AppModalProps {
   title: string;
@@ -15,20 +33,30 @@ interface AppModalProps {
 export function AppModal({ title, description, onClose, children, className = '', closeLabel = 'Close dialog' }: AppModalProps) {
   const titleId = useId();
   const descriptionId = useId();
+  const modalId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
+  const [mounted, setMounted] = useState(false);
   closeRef.current = onClose;
 
   useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!mounted) return;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const previousOverflow = document.body.style.overflow;
+    if (modalStack.length === 0) previousBodyOverflow = document.body.style.overflow;
+    modalStack.push(modalId);
     document.body.style.overflow = 'hidden';
+    updateModalLayers();
     const focusTimer = requestAnimationFrame(() => {
-      const target = dialogRef.current?.querySelector<HTMLElement>('[data-autofocus]')
+      const target = dialogRef.current?.querySelector<HTMLElement>('[data-autofocus], [autofocus]')
         ?? dialogRef.current?.querySelector<HTMLElement>('input:not([disabled]), button:not([disabled]), select:not([disabled]), textarea:not([disabled])');
-      target?.focus();
+      (target ?? dialogRef.current)?.focus();
     });
     const onKeyDown = (event: KeyboardEvent) => {
+      if (modalStack.at(-1) !== modalId) return;
       if (event.key === 'Escape') { event.preventDefault(); closeRef.current(); return; }
       if (event.key !== 'Tab' || !dialogRef.current) return;
       const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
@@ -42,12 +70,17 @@ export function AppModal({ title, description, onClose, children, className = ''
     return () => {
       cancelAnimationFrame(focusTimer);
       document.removeEventListener('keydown', onKeyDown);
-      document.body.style.overflow = previousOverflow;
+      const index = modalStack.lastIndexOf(modalId);
+      if (index >= 0) modalStack.splice(index, 1);
+      updateModalLayers();
+      if (modalStack.length === 0) document.body.style.overflow = previousBodyOverflow;
       previousFocus?.focus();
     };
-  }, []);
+  }, [modalId, mounted]);
 
-  return <div className="modal-backdrop"><div ref={dialogRef} className={`app-modal ${className}`} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined}><div className="modal-header app-modal-header"><div><strong id={titleId}>{title}</strong>{description && <p id={descriptionId}>{description}</p>}</div><button type="button" className="icon-button" onClick={onClose} aria-label={closeLabel}><X /></button></div><div className="app-modal-body">{children}</div></div></div>;
+  if (!mounted) return null;
+
+  return createPortal(<div className="modal-backdrop" data-modal-layer={modalId}><div ref={dialogRef} tabIndex={-1} className={`app-modal ${className}`} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined}><div className="modal-header app-modal-header"><div><strong id={titleId}>{title}</strong>{description && <p id={descriptionId}>{description}</p>}</div><button type="button" className="icon-button" onClick={onClose} aria-label={closeLabel}><X /></button></div><div className="app-modal-body">{children}</div></div></div>, document.body);
 }
 
 interface ConfirmModalProps {

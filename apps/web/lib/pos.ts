@@ -6,10 +6,11 @@ import type {
   PaymentMethod,
   Product,
   ProductUnit,
+  QrPaymentConfirmationSource,
   StoreCommand,
 } from '@gma/contracts';
 import { db, getStoreContext, queueCommand } from './db';
-import { createCommandRequest, requestSync } from './api';
+import { createCommandRequest, requestSync, runManagerApprovedCommand } from './api';
 
 export interface ProductImageInput {
   revision: string;
@@ -32,12 +33,20 @@ export interface CompleteSaleInput {
   paymentMethod: PaymentMethod;
   cashReceived: number | null;
   customerId: string | null;
+  qrPayment?: {
+    reference: string;
+    confirmationSource: QrPaymentConfirmationSource;
+  } | null;
 }
 
 export type RestockMode = 'add' | 'set';
 
 function normalizeQuantity(value: number) {
   return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function isStepAligned(quantity: number, step: number) {
@@ -79,10 +88,12 @@ async function applyLocalCommand<T>(command: StoreCommand, optimistic: () => Pro
 export async function completeSale(input: CompleteSaleInput) {
   if (!input.cart.length) throw new Error('Cart is empty');
   if (input.paymentMethod === 'utang' && !input.customerId) throw new Error('Select an utang customer');
+  if (input.paymentMethod === 'qrph' && !input.qrPayment) throw new Error('Enter the QR Ph payment reference');
 
   const context = await getStoreContext();
   const now = new Date().toISOString();
   const saleId = crypto.randomUUID();
+  const qrPaymentId = input.paymentMethod === 'qrph' ? crypto.randomUUID() : null;
   const transactionNumber = `POS-${now.slice(0, 10).replaceAll('-', '')}-${saleId.toUpperCase()}`;
   const command: StoreCommand = {
     type: 'completeSale',
@@ -93,6 +104,11 @@ export async function completeSale(input: CompleteSaleInput) {
       paymentMethod: input.paymentMethod,
       cashReceived: input.cashReceived,
       customerId: input.customerId,
+      qrPayment: input.paymentMethod === 'qrph' && input.qrPayment && qrPaymentId ? {
+        id: qrPaymentId,
+        reference: input.qrPayment.reference.trim(),
+        confirmationSource: input.qrPayment.confirmationSource,
+      } : null,
       cart: input.cart.map((line) => ({
         productId: line.product.id,
         quantity: line.quantity,
@@ -120,7 +136,8 @@ export async function completeSale(input: CompleteSaleInput) {
     const change = input.paymentMethod === 'cash' ? calculateChange(total, input.cashReceived ?? 0) : null;
     if (input.paymentMethod === 'cash' && change === null) throw new Error('Cash received is less than the total');
 
-    await db.transaction('rw', [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.utangEntries], async () => {
+    let qrPaymentStatus: 'merchant_confirmed' | 'pending_review' | null = null;
+    await db.transaction('rw', [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.utangEntries, db.qrPayments], async () => {
       await db.sales.add({
         id: saleId,
         storeId: context.storeId,
@@ -138,6 +155,40 @@ export async function completeSale(input: CompleteSaleInput) {
         createdAt: now,
         updatedAt: now,
       });
+
+      if (input.paymentMethod === 'qrph' && input.qrPayment && qrPaymentId) {
+        const normalizedReference = normalizeQrReference(input.qrPayment.reference);
+        if (!normalizedReference) throw new Error('Enter a valid QR Ph payment reference');
+        const duplicate = await db.qrPayments
+          .where('normalizedReference').equals(normalizedReference)
+          .filter((payment) => payment.storeId === context.storeId
+            && (payment.status === 'merchant_confirmed' || payment.status === 'verified'))
+          .first();
+        qrPaymentStatus = input.qrPayment.confirmationSource === 'merchant_notification' && !duplicate
+          ? 'merchant_confirmed'
+          : 'pending_review';
+        await db.qrPayments.add({
+          id: qrPaymentId,
+          storeId: context.storeId,
+          saleId,
+          cashierUserId: context.userId,
+          cashierDisplayNameSnapshot: context.session.user.displayName,
+          deviceId: context.deviceId,
+          amount: total,
+          reference: input.qrPayment.reference.trim(),
+          normalizedReference,
+          confirmationSource: input.qrPayment.confirmationSource,
+          status: qrPaymentStatus,
+          attentionReason: duplicate ? 'duplicate_reference' : qrPaymentStatus === 'pending_review' ? 'customer_proof' : null,
+          confirmedAt: now,
+          reviewedAt: null,
+          reviewedByUserId: null,
+          reviewNote: null,
+          recordVersion: 1,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
 
       const runningBase = new Map<string, number>();
       for (let index = 0; index < input.cart.length; index += 1) {
@@ -220,8 +271,46 @@ export async function completeSale(input: CompleteSaleInput) {
       }
     });
 
-    return { saleId, total, change };
+    return { saleId, transactionNumber, total, change, qrPaymentStatus };
   });
+}
+
+export async function reviewQrPayment(paymentId: string, decision: 'verify' | 'reject', note: string) {
+  const context = await getStoreContext();
+  if (!['owner', 'admin'].includes(context.role)) throw new Error('You do not have access to this action');
+  const existing = await db.qrPayments.get(paymentId);
+  if (!existing) throw new Error('QR Ph payment not found');
+  if (existing.status !== 'pending_review') throw new Error('Only pending QR Ph payments can be reviewed');
+  if (decision === 'reject' && !note.trim()) throw new Error('A rejection note is required');
+  if (decision === 'verify') {
+    const duplicate = await db.qrPayments.where('normalizedReference').equals(existing.normalizedReference)
+      .filter((payment) => payment.storeId === context.storeId
+        && payment.id !== paymentId
+        && (payment.status === 'merchant_confirmed' || payment.status === 'verified'))
+      .first();
+    if (duplicate) throw new Error('This reference is already collected by another sale. Reject the duplicate payment instead.');
+  }
+  const command: StoreCommand = {
+    type: 'reviewQrPayment',
+    payload: { paymentId, decision, note: note.trim(), expectedVersion: existing.recordVersion },
+  };
+  return applyLocalCommand(command, async () => {
+    const now = new Date().toISOString();
+    await db.qrPayments.update(paymentId, {
+      status: decision === 'verify' ? 'verified' : 'rejected',
+      attentionReason: null,
+      reviewedAt: now,
+      reviewedByUserId: context.userId,
+      reviewNote: note.trim() || null,
+      updatedAt: now,
+      recordVersion: existing.recordVersion + 1,
+    });
+    return { paymentId, status: decision === 'verify' ? 'verified' as const : 'rejected' as const };
+  });
+}
+
+function normalizeQrReference(reference: string) {
+  return reference.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 80);
 }
 
 export async function saveProduct(input: {
@@ -261,6 +350,11 @@ export async function saveProduct(input: {
   if (!soldByWeight && !Number.isInteger(input.stockQuantity)) throw new Error('Regular products require a whole-number stock quantity');
   if (soldByWeight && !isStepAligned(input.stockQuantity, quantityStep)) throw new Error(`Stock must use increments of ${quantityStep}`);
 
+  const normalizedUnits: ProductUnitInput[] | undefined = input.units?.map((unit) => ({
+    ...unit,
+    id: unit.id ?? crypto.randomUUID(),
+  }));
+
   const product: Product = {
     id: input.id ?? crypto.randomUUID(),
     storeId: context.storeId,
@@ -281,14 +375,14 @@ export async function saveProduct(input: {
     recordVersion: existing ? existing.recordVersion + 1 : 1,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
-    ...(input.units?.length ? {
-      baseUnit: input.units.find((unit) => unit.isBase)?.name ?? input.unit,
-      baseUnitId: input.units.find((unit) => unit.isBase)?.id ?? null,
+    ...(normalizedUnits?.length ? {
+      baseUnit: normalizedUnits.find((unit) => unit.isBase)?.name ?? input.unit,
+      baseUnitId: normalizedUnits.find((unit) => unit.isBase)?.id ?? null,
       stockBaseQuantity: input.stockBaseQuantity ?? input.stockQuantity,
       lowStockBaseThreshold: input.lowStockBaseThreshold ?? input.lowStockThreshold,
-      defaultSaleUnitId: input.defaultSaleUnitId ?? input.units.find((unit) => unit.canSell)?.id ?? null,
-      defaultRestockUnitId: input.defaultRestockUnitId ?? input.units.find((unit) => unit.canRestock)?.id ?? null,
-      displayUnitId: input.displayUnitId ?? input.units.find((unit) => unit.canSell)?.id ?? null,
+      defaultSaleUnitId: input.defaultSaleUnitId ?? normalizedUnits.find((unit) => unit.canSell)?.id ?? null,
+      defaultRestockUnitId: input.defaultRestockUnitId ?? normalizedUnits.find((unit) => unit.canRestock)?.id ?? null,
+      displayUnitId: input.displayUnitId ?? normalizedUnits.find((unit) => unit.canSell)?.id ?? null,
     } : {}),
   };
 
@@ -296,7 +390,7 @@ export async function saveProduct(input: {
     type: 'saveProduct',
     expectedVersion: existing?.recordVersion ?? null,
     payload: {
-      id: existing?.id,
+      id: product.id,
       barcode: normalizedBarcode,
       imageRevision,
       name: product.name,
@@ -316,12 +410,12 @@ export async function saveProduct(input: {
       defaultSaleUnitId: product.defaultSaleUnitId,
       defaultRestockUnitId: product.defaultRestockUnitId,
       displayUnitId: product.displayUnitId,
-      units: input.units,
+      units: normalizedUnits,
     },
   };
-  const unitRows: ProductUnit[] = (input.units ?? []).map((unit) => ({
+  const unitRows: ProductUnit[] = (normalizedUnits ?? []).map((unit) => ({
     ...unit,
-    id: unit.id ?? crypto.randomUUID(),
+    id: unit.id!,
     storeId: context.storeId,
     productId: product.id,
     recordVersion: 1,
@@ -369,10 +463,8 @@ export async function saveProduct(input: {
   });
 }
 
-export async function adjustStock(product: Product, newQuantity: number, note: string) {
+export async function adjustStock(product: Product, newQuantity: number, note: string, password: string) {
   validateStockQuantity(product, newQuantity);
-  const context = await getStoreContext();
-  const now = new Date().toISOString();
   const command: StoreCommand = {
     type: 'adjustStock',
     payload: {
@@ -382,29 +474,7 @@ export async function adjustStock(product: Product, newQuantity: number, note: s
       expectedVersion: product.recordVersion,
     },
   };
-  return applyLocalCommand(command, async () => {
-    await db.transaction('rw', [db.products, db.inventoryMovements], async () => {
-      const current = await db.products.get(product.id);
-      if (!current) throw new Error('Product not found');
-      validateStockQuantity(current, newQuantity);
-      await db.products.update(current.id, { stockQuantity: newQuantity, updatedAt: now, recordVersion: current.recordVersion + 1 });
-      await db.inventoryMovements.add({
-        id: crypto.randomUUID(),
-        storeId: context.storeId,
-        productId: current.id,
-        saleId: null,
-        reason: newQuantity >= current.stockQuantity ? 'restock' : 'adjustment',
-        quantityDelta: newQuantity - current.stockQuantity,
-        stockAfter: newQuantity,
-        note: note || null,
-        actorUserId: context.userId,
-        deviceId: context.deviceId,
-        recordVersion: 1,
-        createdAt: now,
-        updatedAt: now,
-      });
-    });
-  });
+  return runManagerApprovedCommand(command, password);
 }
 
 export async function restockProduct(product: Product, mode: RestockMode, quantity: number, note = 'Quick restock') {
@@ -451,6 +521,7 @@ export async function restockProduct(product: Product, mode: RestockMode, quanti
 
 export async function receiveStock(product: Product, unit: ProductUnit, inputQuantity: number, note = 'Stock received') {
   if (!product.isActive) throw new Error(`${product.name} is inactive and cannot be restocked`);
+  if (!isUuid(unit.id)) throw new Error('This restock unit is from an older local cache. Refresh the store data before restocking it.');
   if (unit.productId !== product.id || !unit.isActive || !unit.canRestock) throw new Error(`${unit.name} cannot be used for receiving stock`);
   convertInputToBase(unit, inputQuantity);
   const context = await getStoreContext();
@@ -482,6 +553,7 @@ export async function receiveStock(product: Product, unit: ProductUnit, inputQua
 }
 
 export async function countStock(product: Product, unit: ProductUnit, inputQuantity: number, reason: NonNullable<import('@gma/contracts').InventoryMovement['adjustmentReason']>, note = 'Physical stock count') {
+  if (!isUuid(unit.id)) throw new Error('This stock unit is from an older local cache. Refresh the store data before counting it.');
   if (!unit.canRestock) throw new Error(`${unit.name} cannot be used for stock counting`);
   const countedBase = inputQuantity === 0 ? 0 : convertInputToBase(unit, inputQuantity);
   const context = await getStoreContext();
@@ -499,6 +571,7 @@ export async function countStock(product: Product, unit: ProductUnit, inputQuant
 }
 
 export async function adjustStockDelta(product: Product, unit: ProductUnit, inputQuantity: number, reason: NonNullable<import('@gma/contracts').InventoryMovement['adjustmentReason']>, note = 'Inventory adjustment') {
+  if (!isUuid(unit.id)) throw new Error('This stock unit is from an older local cache. Refresh the store data before adjusting it.');
   if (!inputQuantity) throw new Error('Adjustment quantity cannot be zero');
   const magnitude = convertInputToBase(unit, Math.abs(inputQuantity));
   const baseDelta = Math.sign(inputQuantity) * magnitude;
