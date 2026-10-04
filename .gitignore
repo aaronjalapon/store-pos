@@ -1,9 +1,45 @@
+# Dependencies and generated application builds
 node_modules/
 .next/
 dist/
+out/
+*.tsbuildinfo
+/apps/web/next-env.d.ts
+
+# Test coverage and browser-test artifacts
 coverage/
+playwright-report/
+test-results/
+blob-report/
+
+# Local environment and runtime data
 .env
-.env.local
+.env.*
+!.env.example
+!.env.*.example
 *.log
-.DS_Store
 apps/api/.storage/
+
+# Generated deliverables, screenshots, and exports
+/output/
+/outputs/
+/artifacts/
+/*-output/
+/*-outputs/
+/presentation-build/
+/presentation-assets/
+/.codex-finalizer/
+
+# Standalone exported documents at the repository root
+# Keep application assets and test fixtures in their source directories.
+/*.pptx
+/*.pdf
+/*.docx
+/*.xlsx
+
+# Local QA reports and captured evidence
+/docs/readiness-audit/
+/design-qa.md
+
+# OS metadata
+.DS_Store
