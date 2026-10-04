@@ -1,0 +1,11 @@
+.git
+.next
+**/.next
+node_modules
+**/node_modules
+coverage
+**/coverage
+.env
+.env.*
+!.env.example
+docs/readiness-audit

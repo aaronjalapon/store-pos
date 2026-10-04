@@ -430,6 +430,7 @@ export async function saveProduct(input: {
       if (input.image) {
         await db.productImages.put({
           productId: product.id,
+          storeId: context.storeId,
           revision: input.image.revision,
           blob: input.image.blob,
           contentType: input.image.contentType,
@@ -439,6 +440,7 @@ export async function saveProduct(input: {
         });
         await db.productImageQueue.put({
           id: `upload:${product.id}:${input.image.revision}`,
+          storeId: context.storeId,
           productId: product.id,
           revision: input.image.revision,
           operation: 'upload',
@@ -451,6 +453,7 @@ export async function saveProduct(input: {
       if (existing?.imageRevision && existing.imageRevision !== imageRevision) {
         await db.productImageQueue.put({
           id: `delete:${product.id}:${existing.imageRevision}`,
+          storeId: context.storeId,
           productId: product.id,
           revision: existing.imageRevision,
           operation: 'delete',

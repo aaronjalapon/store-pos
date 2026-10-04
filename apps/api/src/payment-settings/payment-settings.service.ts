@@ -35,9 +35,12 @@ export class PaymentSettingsService {
 
     const previous = await this.current(principal.storeId);
     const objectKey = this.objectKey(principal.storeId, revision);
-    await this.storage.put(objectKey, body, normalizedType);
-    await this.database.transaction(async (client) => {
-      await client.query(
+    const operationId = crypto.randomUUID();
+    const stagingKey = `staging/qrph/${principal.storeId}/${operationId}`;
+    await this.storage.put(stagingKey, body, normalizedType);
+    try {
+      await this.database.transaction(async (client) => {
+        await client.query(
         `INSERT INTO qrph_payment_settings
          (store_id, image_revision, object_key, content_type, byte_length, updated_at, updated_by_user_id)
          VALUES ($1, $2, $3, $4, $5, now(), $6)
@@ -50,8 +53,21 @@ export class PaymentSettingsService {
            updated_by_user_id = EXCLUDED.updated_by_user_id`,
         [principal.storeId, revision, objectKey, normalizedType, body.byteLength, principal.userId],
       );
+      await client.query(
+        `INSERT INTO object_operations
+         (id, store_id, operation, object_kind, staging_key, final_key, content_type)
+         VALUES ($1, $2, 'finalize', 'qrph_image', $3, $4, $5)`,
+        [operationId, principal.storeId, stagingKey, objectKey, normalizedType],
+      );
+      if (previous && previous.object_key !== objectKey) {
+        await client.query(
+          `INSERT INTO object_operations (id, store_id, operation, object_kind, final_key)
+           VALUES ($1, $2, 'delete', 'qrph_image', $3)`,
+          [crypto.randomUUID(), principal.storeId, previous.object_key],
+        );
+      }
       await this.data.createSyncEvent(client, principal.storeId, 'payment_settings');
-      await this.activity?.record(client, {
+        await this.activity?.record(client, {
         storeId: principal.storeId,
         actor: principal,
         category: 'store',
@@ -60,9 +76,13 @@ export class PaymentSettingsService {
         entityId: principal.storeId,
         summary: 'Updated the store QR Ph code',
         details: { revision, contentType: normalizedType, byteLength: body.byteLength },
+        });
       });
-    });
-    if (previous && previous.object_key !== objectKey) await this.storage.delete(previous.object_key).catch(() => undefined);
+    } catch (error) {
+      await this.storage.delete(stagingKey).catch(() => undefined);
+      throw error;
+    }
+    await this.finalize(operationId, stagingKey, objectKey, normalizedType).catch(() => undefined);
     return this.toSettings(principal.storeId, {
       image_revision: revision,
       object_key: objectKey,
@@ -75,7 +95,13 @@ export class PaymentSettingsService {
   async getQr(principal: SessionPrincipal, revision: string) {
     const current = await this.current(principal.storeId);
     if (!current || current.image_revision !== revision) throw new NotFoundException('QR Ph image not found');
-    return this.storage.get(current.object_key);
+    const pending = await this.database.query<{ staging_key: string | null }>(
+      `SELECT staging_key FROM object_operations
+        WHERE store_id = $1 AND final_key = $2 AND operation = 'finalize' AND status <> 'complete'
+        ORDER BY created_at DESC LIMIT 1`,
+      [principal.storeId, current.object_key],
+    );
+    return this.storage.get(pending.rows[0]?.staging_key ?? current.object_key);
   }
 
   async deleteQr(principal: SessionPrincipal, revision: string) {
@@ -84,6 +110,11 @@ export class PaymentSettingsService {
     if (!current || current.image_revision !== revision) throw new NotFoundException('QR Ph image not found');
     await this.database.transaction(async (client) => {
       await client.query('DELETE FROM qrph_payment_settings WHERE store_id = $1 AND image_revision = $2', [principal.storeId, revision]);
+      await client.query(
+        `INSERT INTO object_operations (id, store_id, operation, object_kind, final_key)
+         VALUES ($1, $2, 'delete', 'qrph_image', $3)`,
+        [crypto.randomUUID(), principal.storeId, current.object_key],
+      );
       await this.data.createSyncEvent(client, principal.storeId, 'payment_settings');
       await this.activity?.record(client, {
         storeId: principal.storeId,
@@ -96,7 +127,15 @@ export class PaymentSettingsService {
         details: { revision },
       });
     });
-    await this.storage.delete(current.object_key).catch(() => undefined);
+    try {
+      await this.storage.delete(current.object_key);
+      await this.database.query(
+        "UPDATE object_operations SET status = 'complete', attempt_count = attempt_count + 1, updated_at = now() WHERE final_key = $1 AND operation = 'delete' AND status = 'pending'",
+        [current.object_key],
+      );
+    } catch {
+      // The durable outbox remains pending for the reconciler.
+    }
     return { deleted: true, revision };
   }
 
@@ -117,6 +156,14 @@ export class PaymentSettingsService {
 
   private objectKey(storeId: string, revision: string) {
     return `payment-settings/${storeId}/qrph/${revision}`;
+  }
+
+  private async finalize(operationId: string, stagingKey: string, objectKey: string, contentType: string) {
+    await this.storage.copy(stagingKey, objectKey, contentType);
+    await this.database.query(
+      "UPDATE object_operations SET status = 'complete', attempt_count = attempt_count + 1, updated_at = now() WHERE id = $1",
+      [operationId],
+    );
   }
 
   private requireManager(principal: SessionPrincipal) {

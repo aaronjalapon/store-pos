@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { AuthController } from './auth/auth.controller';
 import { AuthService } from './auth/auth.service';
+import { AuthRateLimitService } from './auth/auth-rate-limit.service';
 import { SessionAuthGuard } from './auth/session-auth.guard';
 import { BackupsController } from './backups/backups.controller';
 import { BackupsService } from './backups/backups.service';
@@ -24,6 +25,11 @@ import { ActivityController } from './activity/activity.controller';
 import { ActivityService } from './activity/activity.service';
 import { PaymentSettingsController } from './payment-settings/payment-settings.controller';
 import { PaymentSettingsService } from './payment-settings/payment-settings.service';
+import { BackupSchedulerService } from './backups/backup-scheduler.service';
+import { ObjectOperationsService } from './storage/object-operations.service';
+import { RetentionService } from './operations/retention.service';
+import { BackupRestoreService } from './backups/backup-restore.service';
+import { MetricsController } from './operations/metrics.controller';
 
 @Module({
   imports: [
@@ -44,10 +50,12 @@ import { PaymentSettingsService } from './payment-settings/payment-settings.serv
     ActivityController,
     PaymentSettingsController,
     HealthController,
+    MetricsController,
   ],
   providers: [
     DatabaseService,
     AuthService,
+    AuthRateLimitService,
     SessionAuthGuard,
     StoreDataService,
     StoresService,
@@ -56,6 +64,10 @@ import { PaymentSettingsService } from './payment-settings/payment-settings.serv
     ProductImagesService,
     ActivityService,
     PaymentSettingsService,
+    BackupSchedulerService,
+    ObjectOperationsService,
+    RetentionService,
+    BackupRestoreService,
     { provide: ObjectStorage, useClass: S3ObjectStorage },
   ],
 })

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ActivityCategory, ActivityLog, ActivityLogFilters, StoreAuthSession, StoreCommand } from '@gma/contracts';
 import { activityCategories } from '@gma/contracts';
 import { Activity, AlertTriangle, ChevronLeft, Clock3, MonitorSmartphone, RefreshCw, Search, UserRound } from 'lucide-react';
@@ -41,6 +41,8 @@ export function ActivityLogPanel({ session, onClose }: { session: StoreAuthSessi
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [cachedMode, setCachedMode] = useState(false);
+  const loadRef = useRef<(append?: boolean, quiet?: boolean) => Promise<void>>(async () => {});
 
   const requestFilters = useMemo<ActivityLogFilters>(() => ({
     ...(filters.category ? { category: filters.category } : {}),
@@ -52,50 +54,94 @@ export function ActivityLogPanel({ session, onClose }: { session: StoreAuthSessi
     limit: 50,
   }), [filters]);
 
-  const refreshPending = useCallback(async () => {
-    const items = await listQueuedCommands();
-    setPending(items.map((item) => pendingActivity(item, session)));
-  }, [session]);
-
-  const load = useCallback(async (append = false, quiet = false) => {
-    if (!quiet) setBusy(true);
-    setError('');
-    await refreshPending();
-    try {
-      const response = await listActivityLogs({ ...requestFilters, ...(append && nextCursor ? { cursor: nextCursor } : {}) });
-      setConfirmed((current) => append ? dedupeActivity([...current, ...response.activity]) : response.activity);
-      setNextCursor(response.nextCursor);
-    } catch (caught) {
-      if (!append) {
-        const cached = await getCachedActivityLogs(session.store.id);
-        setConfirmed(cached.filter((item) => matchesFilters(item, filters)));
-      }
-      setError(typeof navigator !== 'undefined' && !navigator.onLine
-        ? 'Offline · showing cached and pending activity.'
-        : caught instanceof Error ? caught.message : 'Could not load activity.');
-    } finally {
-      if (!quiet) setBusy(false);
-    }
-  }, [filters, nextCursor, refreshPending, requestFilters, session.store.id]);
-
   useEffect(() => {
-    void load(false);
-  // The memoized request captures every filter; load must not retrigger for pagination changes.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [requestFilters]);
+    let active = true;
+    let inFlight: Promise<void> | null = null;
+    let cursor: string | null = null;
+    let rows: ActivityLog[] = [];
+    let hasLoaded = false;
+    let hasOlderPages = false;
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (navigator.onLine) void load(false, true);
-      else void refreshPending();
-    }, 30_000);
-    const changed = () => void load(false, true);
-    window.addEventListener('pos-sync-state-changed', changed);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener('pos-sync-state-changed', changed);
+    const refreshPending = async () => {
+      const items = await listQueuedCommands();
+      if (active) setPending(items.map((item) => pendingActivity(item, session)));
     };
-  }, [load, refreshPending]);
+    const showCached = async (message: string) => {
+      // Preserve already-loaded pages and their DOM nodes during failed retries.
+      if (!hasLoaded) {
+        const cached = await getCachedActivityLogs(session.store.id);
+        if (!active) return;
+        rows = cached.filter((item) => matchesFilters(item, filters));
+        hasLoaded = true;
+        setConfirmed(rows);
+      }
+      if (active) {
+        setCachedMode(true);
+        setError(message);
+      }
+    };
+    const load = (append = false, quiet = false): Promise<void> => {
+      if (!active) return Promise.resolve();
+      if (inFlight) return inFlight;
+      if (!quiet) setBusy(true);
+      inFlight = (async () => {
+        try {
+          await refreshPending();
+          if (!active) return;
+          if (!navigator.onLine) {
+            await showCached('Offline · showing cached and pending activity.');
+            return;
+          }
+          const response = await listActivityLogs({ ...requestFilters, ...(append && cursor ? { cursor } : {}) });
+          if (!active) return;
+          rows = append || (quiet && hasOlderPages)
+            ? dedupeActivity([...rows, ...response.activity])
+            : response.activity;
+          hasLoaded = true;
+          if (append) hasOlderPages = true;
+          else if (!quiet) hasOlderPages = false;
+          if (append || !quiet || !hasOlderPages) {
+            cursor = response.nextCursor;
+            setNextCursor(cursor);
+          }
+          setConfirmed(rows);
+          setCachedMode(false);
+          setError('');
+        } catch (caught) {
+          if (!active) return;
+          const message = !navigator.onLine
+            ? 'Offline · showing cached and pending activity.'
+            : caught instanceof TypeError
+              ? 'Cannot reach the server · showing cached and pending activity'
+              : caught instanceof Error ? caught.message : 'Could not load activity.';
+          await showCached(message);
+        } finally {
+          inFlight = null;
+          if (active) setBusy(false);
+        }
+      })();
+      return inFlight;
+    };
+    loadRef.current = load;
+    setConfirmed([]);
+    setNextCursor(null);
+    void load();
+    const timer = window.setInterval(() => { void load(false, true); }, 30_000);
+    const pendingChanged = () => { void refreshPending().catch(() => undefined); };
+    const confirmedChanged = () => { void load(false, true); };
+    window.addEventListener('pos-sync-state-changed', pendingChanged);
+    window.addEventListener('pos-commands-synced', confirmedChanged);
+    window.addEventListener('online', confirmedChanged);
+    window.addEventListener('offline', confirmedChanged);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      window.removeEventListener('pos-sync-state-changed', pendingChanged);
+      window.removeEventListener('pos-commands-synced', confirmedChanged);
+      window.removeEventListener('online', confirmedChanged);
+      window.removeEventListener('offline', confirmedChanged);
+    };
+  }, [filters, requestFilters, session]);
 
   const confirmedCommandIds = useMemo(() => new Set(confirmed.map((item) => item.clientCommandId).filter(Boolean)), [confirmed]);
   const visiblePending = pending.filter((item) => !confirmedCommandIds.has(item.clientCommandId) && matchesFilters(item, filters));
@@ -111,7 +157,7 @@ export function ActivityLogPanel({ session, onClose }: { session: StoreAuthSessi
       <div><p className="eyebrow">STORE OVERSIGHT</p><h1>Activity Log</h1><p>Successful store actions, the people behind them, and offline work waiting to sync.</p></div>
       <div className="page-actions">
         <button className="secondary-button" onClick={onClose}><ChevronLeft /> Back to More</button>
-        <button className="primary-button" disabled={busy} onClick={() => void load(false)}><RefreshCw /> {busy ? 'Refreshing…' : 'Refresh'}</button>
+        <button className="primary-button" disabled={busy} onClick={() => void loadRef.current(false)}><RefreshCw /> {busy ? 'Refreshing…' : 'Refresh'}</button>
       </div>
     </div>
 
@@ -131,7 +177,7 @@ export function ActivityLogPanel({ session, onClose }: { session: StoreAuthSessi
       {activity.map((item) => <ActivityRow item={item} key={item.id} />)}
       {!activity.length && !busy && <div className="empty-cart compact-empty"><Activity /><strong>No activity found</strong><p>Actions will appear here after they are completed.</p></div>}
     </div>
-    {nextCursor && <button className="secondary-button activity-load-more" disabled={busy} onClick={() => void load(true)}>Load more</button>}
+    {nextCursor && <button className="secondary-button activity-load-more" disabled={busy || cachedMode} onClick={() => void loadRef.current(true)}>Load more</button>}
   </section>;
 }
 

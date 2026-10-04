@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import type { AuthSession, Customer, Product, ProductUnit } from '@gma/contracts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InventoryView, MoreView, ProductForm, SellView, UtangView } from '../components/pos-app';
@@ -309,6 +310,7 @@ describe('Utang search and app modal improvements', () => {
   });
 
   it('lets managers add both admin and cashier accounts', async () => {
+    const user = userEvent.setup();
     vi.spyOn(apiModule, 'listStaff').mockResolvedValue([]);
     const createStaff = vi.spyOn(apiModule, 'createStaff').mockResolvedValue({
       id: 'staff-1', displayName: 'New staff', email: 'staff@example.com', staffCode: null,
@@ -317,25 +319,33 @@ describe('Utang search and app modal improvements', () => {
 
     render(<StaffPanel />);
 
-    fireEvent.change(screen.getByRole('combobox', { name: 'Role' }), { target: { value: 'admin' } });
-    fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'New admin' } });
-    fireEvent.change(screen.getByLabelText('Email (admin only)'), { target: { value: 'admin@example.com' } });
-    fireEvent.change(screen.getByLabelText('Password / PIN'), { target: { value: 'ChangeMe123!' } });
-    fireEvent.click(screen.getByRole('button', { name: /Add staff/i }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Role' }), 'admin');
+    await user.type(screen.getByLabelText('Display name'), 'New admin');
+    await user.type(screen.getByLabelText('Email (admin only)'), 'admin@example.com');
+    await user.type(screen.getByLabelText('Password / PIN'), 'ChangeMe123!');
+    await user.click(screen.getByRole('button', { name: /Add staff/i }));
 
     await waitFor(() => expect(createStaff).toHaveBeenCalledWith({
       role: 'admin', displayName: 'New admin', email: 'admin@example.com', password: 'ChangeMe123!',
     }));
+    expect(await screen.findByText('Admin created.')).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole('button', { name: /Add staff/i }).hasAttribute('disabled')).toBe(false));
+    expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLSelectElement).value).toBe('cashier');
+    expect((screen.getByLabelText('Display name') as HTMLInputElement).value).toBe('');
 
-    fireEvent.change(screen.getByRole('combobox', { name: 'Role' }), { target: { value: 'cashier' } });
-    fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'New cashier' } });
-    fireEvent.change(screen.getByLabelText('Staff code (cashier only)'), { target: { value: 'CASH002' } });
-    fireEvent.change(screen.getByLabelText('Password / PIN'), { target: { value: '1234' } });
-    fireEvent.click(screen.getByRole('button', { name: /Add staff/i }));
+    await user.type(screen.getByLabelText('Display name'), 'New cashier');
+    await user.type(screen.getByLabelText('Staff code (cashier only)'), 'CASH002');
+    await user.type(screen.getByLabelText('Password / PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: /Add staff/i }));
 
     await waitFor(() => expect(createStaff).toHaveBeenCalledWith({
       role: 'cashier', displayName: 'New cashier', staffCode: 'CASH002', pin: '1234',
     }));
+    expect(await screen.findByText('Cashier created.')).toBeTruthy();
+    expect(createStaff.mock.calls).toEqual([
+      [{ role: 'admin', displayName: 'New admin', email: 'admin@example.com', password: 'ChangeMe123!' }],
+      [{ role: 'cashier', displayName: 'New cashier', staffCode: 'CASH002', pin: '1234' }],
+    ]);
   });
 
   it('keeps cashier accounts in Account view without authorization controls', () => {

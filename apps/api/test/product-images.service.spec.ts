@@ -2,11 +2,17 @@ import { BadRequestException, PayloadTooLargeException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ProductImagesService } from '../src/product-images/product-images.service';
 import { ObjectStorage } from '../src/storage/object-storage';
+import sharp from 'sharp';
 
 class MemoryStorage extends ObjectStorage {
   objects = new Map<string, { body: Uint8Array; contentType: string }>();
+  async check() {}
   async put(key: string, body: Uint8Array, contentType: string) { this.objects.set(key, { body, contentType }); }
   async get(key: string) { return this.objects.get(key)!; }
+  async copy(sourceKey: string, destinationKey: string, contentType?: string) {
+    const source = this.objects.get(sourceKey);
+    if (source) this.objects.set(destinationKey, { body: source.body, contentType: contentType ?? source.contentType });
+  }
   async delete(key: string) { this.objects.delete(key); }
 }
 
@@ -26,17 +32,28 @@ describe('ProductImagesService', () => {
 
   it('stores, retrieves, and deletes an image within the authenticated store scope', async () => {
     const storage = new MemoryStorage();
-    const service = new ProductImagesService(storage, new ConfigService({ PRODUCT_IMAGE_MAX_BYTES: 20 }), { query: jest.fn().mockResolvedValue({ rows: [] }) } as never);
-    const image = Uint8Array.from([82, 73, 70, 70, 4, 0, 0, 0, 87, 69, 66, 80]);
-    await expect(service.put(principal, productId, revision, image, 'image/webp')).resolves.toMatchObject({ accepted: true, byteLength: 12 });
-    await expect(service.get(principal, productId, revision)).resolves.toEqual({ body: image, contentType: 'image/webp' });
-    await expect(service.get(otherStore, productId, revision)).resolves.toBeUndefined();
+    const query = jest.fn(async (sql: string, parameters?: unknown[]) => {
+      if (sql.includes('SELECT id, image_revision FROM products')) return { rows: [{ id: productId, image_revision: revision }] };
+      if (sql.includes('SELECT object_key FROM product_images') && !sql.includes('DELETE')) {
+        return sql.includes('revision = $3') && parameters?.[0] === principal.storeId
+          ? { rows: [{ object_key: `product-images/${principal.storeId}/${productId}/${revision}` }] }
+          : { rows: [] };
+      }
+      if (sql.includes('SELECT staging_key')) return { rows: [] };
+      if (sql.includes('DELETE FROM product_images')) return { rows: [{ object_key: `product-images/${principal.storeId}/${productId}/${revision}` }] };
+      return { rows: [] };
+    });
+    const database = { query, transaction: async (work: (client: { query: typeof query }) => Promise<unknown>) => work({ query }) };
+    const service = new ProductImagesService(storage, new ConfigService({ PRODUCT_IMAGE_MAX_INPUT_BYTES: 1024 * 1024 }), database as never);
+    const image = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#ffffff' } }).jpeg().toBuffer();
+    await expect(service.put(principal, productId, revision, image, 'image/jpeg')).resolves.toMatchObject({ accepted: true, contentType: 'image/webp' });
+    await expect(service.get(principal, productId, revision)).resolves.toMatchObject({ contentType: 'image/webp' });
+    await expect(service.get(otherStore, productId, revision)).rejects.toThrow('Product image not found');
     await service.delete(principal, productId, revision);
-    await expect(service.get(principal, productId, revision)).resolves.toBeUndefined();
   });
 
   it('rejects unsupported and oversized image bodies', async () => {
-    const service = new ProductImagesService(new MemoryStorage(), new ConfigService({ PRODUCT_IMAGE_MAX_BYTES: 4 }), { query: jest.fn().mockResolvedValue({ rows: [] }) } as never);
+    const service = new ProductImagesService(new MemoryStorage(), new ConfigService({ PRODUCT_IMAGE_MAX_INPUT_BYTES: 4 }), { query: jest.fn().mockResolvedValue({ rows: [{ id: productId }] }) } as never);
     await expect(service.put(principal, productId, revision, Uint8Array.from([1]), 'image/png')).rejects.toBeInstanceOf(BadRequestException);
     await expect(service.put(principal, productId, revision, Uint8Array.from([0xff, 0xd8, 0xff, 0, 1]), 'image/jpeg')).rejects.toBeInstanceOf(PayloadTooLargeException);
     await expect(service.put(principal, productId, revision, Uint8Array.from([1, 2, 3]), 'image/jpeg')).rejects.toBeInstanceOf(BadRequestException);

@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type { StoreAuthSession } from '@gma/contracts';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { ActivityLog, ActivityLogListResponse, StoreAuthSession } from '@gma/contracts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ActivityLogPanel } from '../components/activity-log-panel';
 import { MoreView } from '../components/pos-app';
@@ -14,6 +14,21 @@ const session: StoreAuthSession = {
   user: { id: 'owner', displayName: 'Test Owner', email: 'owner@example.com', staffCode: null, role: 'owner' },
 };
 
+function activity(id: string, category: ActivityLog['category'] = 'sales'): ActivityLog {
+  return {
+    id, storeId: 'store', actor: { userId: 'owner', displayName: 'Test Owner', role: 'owner' }, submittedBy: null,
+    deviceId: 'device', deviceName: 'Front counter', category, action: 'sale.completed', entityType: 'sale', entityId: id,
+    summary: `Activity ${id}`, details: { total: 12500 }, clientCommandId: null, status: 'confirmed', occurredAt: now, confirmedAt: now,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
 describe('Activity log UI and cache', () => {
   beforeEach(async () => {
     await db.delete();
@@ -21,7 +36,132 @@ describe('Activity log UI and cache', () => {
     await saveSession(session);
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   });
-  afterEach(async () => { cleanup(); await db.delete(); vi.restoreAllMocks(); });
+  afterEach(async () => { cleanup(); vi.useRealTimers(); await db.delete(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it('settles rejected fetches and keeps the notice and expanded cache mounted through retries', async () => {
+    await cacheActivityLogs([activity('cached')]);
+    const retry = deferred<Response>();
+    const fetchMock = vi.fn().mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockReturnValueOnce(retry.promise)
+      .mockResolvedValue(new Response(JSON.stringify({ activity: [activity('cached')], nextCursor: null })));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = render(<ActivityLogPanel session={session} onClose={vi.fn()} />);
+    const notice = await screen.findByText('Cannot reach the server · showing cached and pending activity');
+    const row = screen.getByText('Activity cached').closest('article');
+    const details = view.container.querySelector<HTMLDetailsElement>('.activity-details')!;
+    details.open = true;
+
+    await queueCommand({ clientCommandId: crypto.randomUUID(), baseCursor: 0,
+      command: { type: 'recordExpense', payload: { category: 'Supplies', description: 'Offline labels', amount: 300, occurredAt: now } } });
+    act(() => {
+      for (let index = 0; index < 10; index += 1) window.dispatchEvent(new Event('pos-sync-state-changed'));
+    });
+    expect(await screen.findByText('Recorded expense for Offline labels')).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(notice.textContent!.trim())).toBe(notice);
+    expect(screen.getByText('Activity cached').closest('article')).toBe(row);
+    expect(details.open).toBe(true);
+    await act(async () => { retry.reject(new TypeError('Failed to fetch')); });
+    await screen.findByRole('button', { name: 'Refresh' });
+    expect(screen.getByText(notice.textContent!.trim())).toBe(notice);
+    expect(details.open).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(view.container.querySelector('.activity-notice')).toBeNull());
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('filters cached and pending activity offline without issuing a request', async () => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
+    await cacheActivityLogs([activity('sale'), activity('expense', 'expenses')]);
+    await queueCommand({ clientCommandId: crypto.randomUUID(), baseCursor: 0,
+      command: { type: 'recordExpense', payload: { category: 'Supplies', description: 'Offline supplies', amount: 300, occurredAt: now } } });
+    const list = vi.spyOn(apiModule, 'listActivityLogs');
+    render(<ActivityLogPanel session={session} onClose={vi.fn()} />);
+    expect(await screen.findByText('Activity sale')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Activity category'), { target: { value: 'expenses' } });
+    expect(await screen.findByText('Activity expense')).toBeTruthy();
+    expect(await screen.findByText('Recorded expense for Offline supplies')).toBeTruthy();
+    expect(screen.queryByText('Activity sale')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await screen.findByRole('button', { name: 'Refresh' });
+    expect(list).not.toHaveBeenCalled();
+    expect(screen.getByText('Offline · showing cached and pending activity.')).toBeTruthy();
+  });
+
+  it('coalesces overlapping refreshes and ignores obsolete filter and unmounted responses', async () => {
+    const first = deferred<ActivityLogListResponse>();
+    const second = deferred<ActivityLogListResponse>();
+    const third = deferred<ActivityLogListResponse>();
+    const list = vi.spyOn(apiModule, 'listActivityLogs').mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise).mockReturnValueOnce(third.promise);
+    const view = render(<ActivityLogPanel session={session} onClose={vi.fn()} />);
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    act(() => {
+      window.dispatchEvent(new Event('online'));
+      window.dispatchEvent(new Event('pos-commands-synced'));
+      window.dispatchEvent(new Event('pos-commands-synced'));
+    });
+    expect(list).toHaveBeenCalledTimes(1);
+    fireEvent.change(screen.getByLabelText('Activity category'), { target: { value: 'expenses' } });
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    await act(async () => { second.resolve({ activity: [activity('current', 'expenses')], nextCursor: null }); });
+    expect(await screen.findByText('Activity current')).toBeTruthy();
+    await act(async () => { first.resolve({ activity: [activity('obsolete')], nextCursor: 'obsolete-cursor' }); });
+    expect(screen.queryByText('Activity obsolete')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Load more' })).toBeNull();
+    act(() => { window.dispatchEvent(new Event('pos-commands-synced')); });
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
+    view.unmount();
+    await act(async () => { third.resolve({ activity: [activity('unmounted')], nextCursor: null }); });
+    expect(view.container.textContent).toBe('');
+  });
+
+  it('preserves loaded pages, details and pagination cursor after a failed background refresh', async () => {
+    const list = vi.spyOn(apiModule, 'listActivityLogs')
+      .mockResolvedValueOnce({ activity: [activity('newer')], nextCursor: 'page-two' })
+      .mockResolvedValueOnce({ activity: [activity('older')], nextCursor: 'page-three' })
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce({ activity: [activity('newer')], nextCursor: 'page-two' })
+      .mockResolvedValue({ activity: [], nextCursor: null });
+    const view = render(<ActivityLogPanel session={session} onClose={vi.fn()} />);
+    await screen.findByText('Activity newer');
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    await screen.findByText('Activity older');
+    const details = view.container.querySelector<HTMLDetailsElement>('.activity-details')!;
+    details.open = true;
+    act(() => { window.dispatchEvent(new Event('pos-commands-synced')); });
+    await screen.findByText('Cannot reach the server · showing cached and pending activity');
+    expect(screen.getByText('Activity newer')).toBeTruthy();
+    expect(screen.getByText('Activity older')).toBeTruthy();
+    expect(view.container.querySelector('.activity-details')).toBe(details);
+    expect(details.open).toBe(true);
+    expect((screen.getByRole('button', { name: 'Load more' }) as HTMLButtonElement).disabled).toBe(true);
+    act(() => { window.dispatchEvent(new Event('online')); });
+    await waitFor(() => expect(view.container.querySelector('.activity-notice')).toBeNull());
+    expect(screen.getByText('Activity older')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    await waitFor(() => expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: 'page-three' })));
+  });
+
+  it('polls every 30 seconds online and only reads local records offline', async () => {
+    const list = vi.spyOn(apiModule, 'listActivityLogs').mockResolvedValue({ activity: [activity('poll')], nextCursor: null });
+    render(<ActivityLogPanel session={session} onClose={vi.fn()} />);
+    await screen.findByText('Activity poll');
+    // Only fake the interval clock; IndexedDB continues using real task scheduling.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    fireEvent.change(screen.getByLabelText('Activity category'), { target: { value: 'sales' } });
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    await screen.findByText('Offline · showing cached and pending activity.');
+    expect(list).toHaveBeenCalledTimes(3);
+  });
 
   it('opens from More for a manager and renders confirmed actor and role', async () => {
     vi.spyOn(apiModule, 'listActivityLogs').mockResolvedValue({
@@ -58,7 +198,7 @@ describe('Activity log UI and cache', () => {
         summary: 'Recorded ₱5.00 expense for Paper bags', details: { amount: 500 }, clientCommandId: '00000000-0000-4000-8000-000000000001', status: 'confirmed', occurredAt: now, confirmedAt: now,
       }], nextCursor: null,
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    act(() => { window.dispatchEvent(new Event('pos-commands-synced')); });
     await waitFor(() => expect(screen.getByText('Recorded ₱5.00 expense for Paper bags')).toBeTruthy());
     expect(view.container.querySelectorAll('.activity-row')).toHaveLength(1);
   });

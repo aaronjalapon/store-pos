@@ -32,14 +32,17 @@ describe('AuthService store lifecycle enforcement', () => {
 
   it('rejects an existing token after its store is suspended', async () => {
     const database = {
-      query: jest.fn().mockResolvedValueOnce({ rows: [{
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ credential_version: 1 }] })
+        .mockResolvedValueOnce({ rows: [{
         user_id: 'owner', display_name: 'Owner', email: 'owner@example.com', staff_code: null,
         password_hash: hashSecret('password'), pin_hash: null, user_active: true, membership_active: true,
-        store_active: false, role: 'owner', store_id: 'store', store_name: 'Store',
+        store_active: false, maintenance_mode: false, credential_version: 1, role: 'owner', store_id: 'store', store_name: 'Store',
         store_created_at: new Date(), store_updated_at: new Date(),
       }] }),
     };
     const jwt = { verifyAsync: jest.fn().mockResolvedValue({
+      jti: 'session', credentialVersion: 1,
       sub: 'owner', storeId: 'store', deviceId: 'device', role: 'owner',
       displayName: 'Owner', email: 'owner@example.com', staffCode: null,
     }) };

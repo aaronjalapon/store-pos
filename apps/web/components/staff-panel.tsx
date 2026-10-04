@@ -1,18 +1,20 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import type { StaffMember } from '@gma/contracts';
+import type { DeviceEnrollmentChallenge, StaffMember } from '@gma/contracts';
 import { KeyRound, Shield, Users } from 'lucide-react';
-import { createStaff, disableStaff, isManagerAccessDenied, listStaff, resetStaffSecret } from '../lib/api';
+import { createStaff, decideDeviceEnrollment, disableStaff, isManagerAccessDenied, listDeviceEnrollments, listStaff, resetStaffSecret } from '../lib/api';
 
 export function StaffPanel({ onAccessDenied, disabled = false }: {
   onAccessDenied?: (message: string) => void;
   disabled?: boolean;
 }) {
   const [staff, setStaff] = useState<StaffMember[]>([]);
+  const [enrollments, setEnrollments] = useState<DeviceEnrollmentChallenge[]>([]);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const [accessDenied, setAccessDenied] = useState(false);
+  const [formVersion, setFormVersion] = useState(0);
 
   const handleError = (error: unknown) => {
     const nextMessage = error instanceof Error ? error.message : 'Something went wrong';
@@ -25,9 +27,17 @@ export function StaffPanel({ onAccessDenied, disabled = false }: {
 
   const refresh = async () => {
     try {
-      const nextStaff = await listStaff();
-      setStaff(nextStaff);
+      setStaff(await listStaff());
       setMessage('');
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const refreshEnrollments = async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    try {
+      setEnrollments(await listDeviceEnrollments());
     } catch (error) {
       handleError(error);
     }
@@ -41,6 +51,7 @@ export function StaffPanel({ onAccessDenied, disabled = false }: {
         if (!active) return;
         setStaff(nextStaff);
         setMessage('');
+        void refreshEnrollments();
       } catch (error) {
         if (!active) return;
         handleError(error);
@@ -72,7 +83,7 @@ export function StaffPanel({ onAccessDenied, disabled = false }: {
         <div><p className="eyebrow">AUTHORIZATION</p><h2>Staff access</h2></div>
         <Users />
       </div>
-      <form className="stack-form" onSubmit={(event) => {
+      <form key={formVersion} className="stack-form" onSubmit={(event) => {
         event.preventDefault();
         const form = event.currentTarget;
         const values = new FormData(form);
@@ -94,6 +105,7 @@ export function StaffPanel({ onAccessDenied, disabled = false }: {
             });
           }
           form.reset();
+          setFormVersion((version) => version + 1);
         }, `${role === 'admin' ? 'Admin' : 'Cashier'} created.`);
       }}>
         <label>Role<select name="role" defaultValue="cashier" disabled={disabled || accessDenied || busy}><option value="cashier">Cashier</option><option value="admin">Admin</option></select></label>
@@ -124,6 +136,18 @@ export function StaffPanel({ onAccessDenied, disabled = false }: {
             </div>
           </div>
         ))}
+      </div>
+      <div className="recent-expenses">
+        <strong>Pending device enrollment</strong>
+        {enrollments.length ? enrollments.map((challenge) => (
+          <div key={challenge.id} className="staff-row">
+            <span>{challenge.deviceName}<small>{challenge.displayName} · expires {new Date(challenge.expiresAt).toLocaleString('en-PH')}</small></span>
+            <div className="staff-actions">
+              <button type="button" className="primary-button compact" disabled={disabled || busy} onClick={() => void run(async () => { await decideDeviceEnrollment(challenge.id, true); setEnrollments((current) => current.filter((item) => item.id !== challenge.id)); }, `${challenge.deviceName} approved.`)}>Approve</button>
+              <button type="button" className="danger-button" disabled={disabled || busy} onClick={() => void run(async () => { await decideDeviceEnrollment(challenge.id, false); setEnrollments((current) => current.filter((item) => item.id !== challenge.id)); }, `${challenge.deviceName} denied.`)}>Deny</button>
+            </div>
+          </div>
+        )) : <p className="muted">No devices are waiting for approval.</p>}
       </div>
       {message && <p className="form-message">{message}</p>}
     </section>

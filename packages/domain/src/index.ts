@@ -8,10 +8,9 @@ export interface CartLine {
   subtotalOverride?: number;
 }
 
-export function calculateSaleTotals(lines: CartLine[], discount = 0) {
+export function calculateSaleTotals(lines: CartLine[]) {
   const subtotal = lines.reduce((sum, line) => sum + (line.subtotalOverride ?? Math.round(line.quantity * line.unitPrice)), 0);
-  const normalizedDiscount = Math.max(0, Math.min(discount, subtotal));
-  return { subtotal, discount: normalizedDiscount, total: subtotal - normalizedDiscount };
+  return { subtotal, discount: 0, total: subtotal };
 }
 
 export function calculateChange(total: number, cashReceived: number) {

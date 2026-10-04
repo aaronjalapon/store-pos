@@ -15,7 +15,9 @@
     "dev": "npm run build:packages && concurrently -n api,web -c blue,green \"npm run dev -w @gma/api\" \"npm run dev -w @gma/web\"",
     "test": "npm run build:packages && npm run test -w @gma/domain && npm run test -w @gma/api && npm run test -w @gma/web",
     "typecheck": "npm run build:packages && npm run typecheck -w @gma/api && npm run typecheck -w @gma/web",
-    "db:migrate": "npm run db:migrate -w @gma/api"
+    "db:migrate": "npm run db:migrate -w @gma/api",
+    "test:real-stack": "node scripts/real-stack-acceptance.mjs",
+    "test:final-qa": "node scripts/final-qa-acceptance.mjs && node scripts/final-qa-auth.mjs && node scripts/final-qa-migrations.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

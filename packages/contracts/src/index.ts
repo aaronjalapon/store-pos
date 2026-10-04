@@ -35,6 +35,9 @@ export type CommandStatus = (typeof commandStatuses)[number];
 export const commandConflictReasons = [
   'stale_product',
   'stale_customer',
+  'unit_product_mismatch',
+  'inactive_unit',
+  'full_resync_required',
   'not_found',
   'inactive',
   'permission_denied',
@@ -59,6 +62,29 @@ export interface DeviceInfo {
   lastSeenAt: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface DeviceEnrollmentRequiredResponse {
+  code: 'device_enrollment_required';
+  challengeId: string;
+  expiresAt: string;
+}
+
+export interface DeviceEnrollmentDecisionResponse {
+  challengeId: string;
+  status: 'approved' | 'denied';
+}
+
+export interface DeviceEnrollmentChallenge {
+  id: string;
+  storeId: string;
+  storeName: string;
+  userId: string;
+  displayName: string;
+  deviceId: string;
+  deviceName: string;
+  expiresAt: string;
+  createdAt: string;
 }
 
 export interface SessionUser {
@@ -336,6 +362,25 @@ export interface StoreSyncResponse {
   snapshot: StoreSnapshot;
 }
 
+export interface EntityChange {
+  cursor: number;
+  entityType: string;
+  entityId: string;
+  operation: 'upsert' | 'delete';
+  changedAt: string;
+}
+
+export interface StoreDeltaSyncResponse {
+  cursor: number;
+  changes: EntityChange[];
+  tombstones: EntityChange[];
+  hasMore: boolean;
+  patch?: Partial<StoreSnapshot>;
+  /** @deprecated Transitional compatibility for pre-patch sync-v2 clients. */
+  fullSnapshot?: StoreSnapshot;
+  historyWindowStart: string;
+}
+
 export interface StoreBootstrapResponse extends StoreSyncResponse {
   session: AuthSession;
 }
@@ -436,6 +481,11 @@ export interface AuthSessionResponse {
 export interface LogoutResponse {
   loggedOut: true;
 }
+
+export const deviceEnrollmentDecisionSchema = z.object({
+  approve: z.boolean(),
+});
+export type DeviceEnrollmentDecisionRequest = z.infer<typeof deviceEnrollmentDecisionSchema>;
 
 export const adminStaffInputSchema = z.object({
   role: z.literal('admin'),
@@ -682,7 +732,7 @@ export type StoreCommandRequest = z.infer<typeof storeCommandRequestSchema>;
 export interface CommandAppliedResponse {
   status: 'applied';
   cursor: number;
-  snapshot: StoreSnapshot;
+  snapshot?: StoreSnapshot;
   message?: string;
   saleId?: string;
 }
@@ -692,7 +742,7 @@ export interface CommandConflictResponse {
   reason: CommandConflictReason;
   cursor: number;
   message: string;
-  snapshot: StoreSnapshot;
+  snapshot?: StoreSnapshot;
 }
 
 export type StoreCommandResponse = CommandAppliedResponse | CommandConflictResponse;

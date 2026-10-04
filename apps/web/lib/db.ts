@@ -15,6 +15,7 @@ import type {
   Sale,
   SaleItem,
   StoreCommandRequest,
+  StoreDeltaSyncResponse,
   StoreSnapshot,
   StoreSyncResponse,
   UtangEntry,
@@ -27,11 +28,13 @@ export interface AppSetting {
 
 export interface MutationQueueItem {
   id: string;
+  storeId: string;
   request: StoreCommandRequest;
   createdAt: string;
   status: 'pending' | 'syncing' | 'needs_attention';
   attemptCount: number;
   lastAttemptAt: string | null;
+  nextAttemptAt: string | null;
   errorMessage: string | null;
   actor?: ActivityActor;
   deviceName?: string | null;
@@ -41,6 +44,7 @@ export type ActivityLogCacheRecord = ActivityLog;
 
 export interface ProductImageRecord {
   productId: string;
+  storeId: string;
   revision: string;
   blob: Blob;
   contentType: 'image/webp' | 'image/jpeg';
@@ -51,6 +55,7 @@ export interface ProductImageRecord {
 
 export interface ProductImageQueueItem {
   id: string;
+  storeId: string;
   productId: string;
   revision: string;
   operation: 'upload' | 'delete';
@@ -60,6 +65,7 @@ export interface ProductImageQueueItem {
 
 export interface QrPhImageRecord {
   key: 'qrph';
+  storeId: string;
   revision: string;
   blob: Blob;
   contentType: QrPhPaymentSettings['contentType'];
@@ -167,6 +173,34 @@ export class PosDatabase extends Dexie {
       paymentSettings: 'storeId, imageRevision, updatedAt',
       qrPhImages: 'key, revision, updatedAt',
     });
+    this.version(9).stores({
+      products: 'id, storeId, &barcode, name, category, isQuickItem, isActive, updatedAt, recordVersion, baseUnit',
+      productUnits: 'id, storeId, productId, barcode, isActive, canSell, canRestock, updatedAt',
+      sales: 'id, storeId, transactionNumber, createdAt, paymentMethod, customerId, cashierUserId',
+      saleItems: 'id, storeId, saleId, productId, productUnitId, createdAt',
+      inventoryMovements: 'id, storeId, productId, productUnitId, saleId, createdAt',
+      customers: 'id, storeId, name, isActive, updatedAt, recordVersion',
+      utangEntries: 'id, storeId, customerId, saleId, createdAt',
+      expenses: 'id, storeId, category, occurredAt, createdAt',
+      settings: 'key',
+      mutationQueue: 'id, storeId, status, createdAt',
+      productImages: 'productId, storeId, revision, syncStatus, updatedAt',
+      productImageQueue: 'id, storeId, operation, productId, revision',
+      activityLogCache: 'id, storeId, category, actor.userId, actor.role, occurredAt, clientCommandId',
+      qrPayments: 'id, storeId, &saleId, status, normalizedReference, confirmedAt',
+      paymentSettings: 'storeId, imageRevision, updatedAt',
+      qrPhImages: 'key, storeId, revision, updatedAt',
+    }).upgrade(async (transaction) => {
+      const activeStoreId = (await transaction.table<AppSetting>('settings').get(STORE_ID_KEY))?.value;
+      if (typeof activeStoreId !== 'string' || !activeStoreId) return;
+      await Promise.all([
+        transaction.table<MutationQueueItem>('mutationQueue').toCollection().modify((item) => { item.storeId = item.storeId || activeStoreId; }),
+        transaction.table<ProductImageRecord>('productImages').toCollection().modify((item) => { item.storeId = item.storeId || activeStoreId; }),
+        transaction.table<ProductImageQueueItem>('productImageQueue').toCollection().modify((item) => { item.storeId = item.storeId || activeStoreId; }),
+        transaction.table<QrPhImageRecord>('qrPhImages').toCollection().modify((item) => { item.storeId = item.storeId || activeStoreId; }),
+      ]);
+      await transaction.table<MutationQueueItem>('mutationQueue').toCollection().modify((item) => { item.nextAttemptAt = item.nextAttemptAt ?? null; });
+    });
   }
 }
 
@@ -227,12 +261,42 @@ export async function hasCompletedBootstrap() {
 }
 
 export async function saveSession(session: AuthSession) {
+  if (session.store) await prepareStoreSwitch(session.store.id);
   const writes = [
     setSetting(SESSION_KEY, session),
     setSetting(TOKEN_KEY, session.token),
   ];
   if (session.store) writes.push(setSetting(STORE_ID_KEY, session.store.id));
   await Promise.all(writes);
+}
+
+export async function prepareStoreSwitch(nextStoreId: string) {
+  const currentStoreId = await getActiveStoreId();
+  if (!currentStoreId || currentStoreId === nextStoreId) return;
+  const [commands, imageOperations] = await Promise.all([
+    db.mutationQueue.where('storeId').equals(currentStoreId).count(),
+    db.productImageQueue.where('storeId').equals(currentStoreId).count(),
+  ]);
+  if (commands + imageOperations > 0) {
+    throw new Error('This device has unresolved offline work for another store. Reconnect and finish syncing it before switching stores.');
+  }
+  await clearCachedStoreData();
+}
+
+async function clearCachedStoreData() {
+  await db.transaction('rw', [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.productImages, db.productImageQueue, db.activityLogCache, db.qrPayments, db.paymentSettings, db.qrPhImages, db.settings], async () => {
+    await Promise.all([
+      db.products.clear(), db.productUnits.clear(), db.sales.clear(), db.saleItems.clear(),
+      db.inventoryMovements.clear(), db.customers.clear(), db.utangEntries.clear(), db.expenses.clear(),
+      db.productImages.clear(), db.productImageQueue.clear(), db.activityLogCache.clear(),
+      db.qrPayments.clear(), db.paymentSettings.clear(), db.qrPhImages.clear(),
+    ]);
+    await db.settings.bulkPut([
+      { key: BOOTSTRAP_KEY, value: false },
+      { key: CURSOR_KEY, value: 0 },
+      { key: CONFLICT_KEY, value: '' },
+    ]);
+  });
 }
 
 export async function clearSession() {
@@ -243,11 +307,20 @@ export async function clearSession() {
 }
 
 export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: number, skipWhenQueued = false) {
+  const activeStoreId = await getActiveStoreId();
+  const snapshotStoreIds = [
+    ...snapshot.products, ...(snapshot.productUnits ?? []), ...snapshot.sales, ...snapshot.saleItems,
+    ...snapshot.inventoryMovements, ...snapshot.customers, ...snapshot.utangEntries, ...snapshot.expenses,
+    ...(snapshot.qrPayments ?? []), ...(snapshot.paymentSettings ? [snapshot.paymentSettings] : []),
+  ].map((record) => record.storeId);
+  if (activeStoreId && snapshotStoreIds.some((storeId) => storeId !== activeStoreId)) {
+    throw new Error('Refusing to cache data for a different store');
+  }
   const replaced = await db.transaction(
     'rw',
     [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.qrPayments, db.paymentSettings, db.settings, db.mutationQueue],
     async () => {
-      if (skipWhenQueued && await db.mutationQueue.count() > 0) return false;
+      if (skipWhenQueued && activeStoreId && await db.mutationQueue.where('storeId').equals(activeStoreId).count() > 0) return false;
       await Promise.all([
         db.products.clear(),
         db.productUnits.clear(),
@@ -277,7 +350,7 @@ export async function replaceStoreSnapshot(snapshot: StoreSnapshot, cursor: numb
       return true;
     },
   );
-  if (replaced) window.dispatchEvent(new Event('pos-data-changed'));
+  if (replaced) window.dispatchEvent(new CustomEvent('pos-data-changed', { detail: { source: 'server' } }));
   return replaced;
 }
 
@@ -285,16 +358,89 @@ export async function applyServerSync(sync: StoreSyncResponse) {
   return replaceStoreSnapshot(sync.snapshot, sync.cursor, true);
 }
 
+export async function applyServerDelta(delta: StoreDeltaSyncResponse) {
+  const storeId = await getActiveStoreId();
+  if (!storeId) throw new Error('Choose a store before applying server changes');
+  const patch = delta.patch;
+  if (patch) {
+    const records = [
+      ...(patch.products ?? []), ...(patch.productUnits ?? []), ...(patch.sales ?? []),
+      ...(patch.saleItems ?? []), ...(patch.inventoryMovements ?? []), ...(patch.customers ?? []),
+      ...(patch.utangEntries ?? []), ...(patch.expenses ?? []), ...(patch.qrPayments ?? []),
+      ...(patch.paymentSettings ? [patch.paymentSettings] : []),
+    ];
+    if (records.some((record) => record.storeId !== storeId)) {
+      throw new Error('Refusing to apply changes for a different store');
+    }
+  }
+  const applied = await db.transaction(
+    'rw',
+    [db.products, db.productUnits, db.sales, db.saleItems, db.inventoryMovements, db.customers, db.utangEntries, db.expenses, db.qrPayments, db.paymentSettings, db.settings, db.mutationQueue],
+    async () => {
+      if (await db.mutationQueue.where('storeId').equals(storeId).count() > 0) return false;
+      if (patch?.products !== undefined) {
+        await db.products.where('storeId').equals(storeId).delete();
+        if (patch.products.length) await db.products.bulkPut(patch.products);
+      }
+      if (patch?.productUnits !== undefined) {
+        await db.productUnits.where('storeId').equals(storeId).delete();
+        if (patch.productUnits.length) await db.productUnits.bulkPut(patch.productUnits);
+      }
+      if (patch?.sales !== undefined) {
+        await db.sales.where('storeId').equals(storeId).delete();
+        if (patch.sales.length) await db.sales.bulkPut(patch.sales);
+      }
+      if (patch?.saleItems !== undefined) {
+        await db.saleItems.where('storeId').equals(storeId).delete();
+        if (patch.saleItems.length) await db.saleItems.bulkPut(patch.saleItems);
+      }
+      if (patch?.inventoryMovements !== undefined) {
+        await db.inventoryMovements.where('storeId').equals(storeId).delete();
+        if (patch.inventoryMovements.length) await db.inventoryMovements.bulkPut(patch.inventoryMovements);
+      }
+      if (patch?.customers !== undefined) {
+        await db.customers.where('storeId').equals(storeId).delete();
+        if (patch.customers.length) await db.customers.bulkPut(patch.customers);
+      }
+      if (patch?.utangEntries !== undefined) {
+        await db.utangEntries.where('storeId').equals(storeId).delete();
+        if (patch.utangEntries.length) await db.utangEntries.bulkPut(patch.utangEntries);
+      }
+      if (patch?.expenses !== undefined) {
+        await db.expenses.where('storeId').equals(storeId).delete();
+        if (patch.expenses.length) await db.expenses.bulkPut(patch.expenses);
+      }
+      if (patch?.qrPayments !== undefined) {
+        await db.qrPayments.where('storeId').equals(storeId).delete();
+        if (patch.qrPayments.length) await db.qrPayments.bulkPut(patch.qrPayments);
+      }
+      if (patch && Object.prototype.hasOwnProperty.call(patch, 'paymentSettings')) {
+        await db.paymentSettings.where('storeId').equals(storeId).delete();
+        if (patch.paymentSettings) await db.paymentSettings.put(patch.paymentSettings);
+      }
+      await setSetting(CURSOR_KEY, delta.cursor);
+      return true;
+    },
+  );
+  const hasEntityChanges = patch && Object.keys(patch).length > 0;
+  if (applied && hasEntityChanges && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('pos-data-changed', { detail: { source: 'server' } }));
+  }
+  return applied;
+}
+
 export async function queueCommand(request: StoreCommandRequest) {
   const [session, deviceName, latest] = await Promise.all([getSession(), getDeviceName(), db.mutationQueue.orderBy('createdAt').last()]);
   const createdAt = new Date(Math.max(Date.now(), latest ? Date.parse(latest.createdAt) + 1 : 0)).toISOString();
   await db.mutationQueue.put({
     id: request.clientCommandId,
+    storeId: session?.store?.id ?? (() => { throw new Error('Choose a store before creating offline work'); })(),
     request,
     createdAt,
     status: 'pending',
     attemptCount: 0,
     lastAttemptAt: null,
+    nextAttemptAt: null,
     errorMessage: null,
     actor: session ? {
       userId: session.user.id,
@@ -324,7 +470,10 @@ export async function removeQueuedCommand(id: string) {
 }
 
 export async function listQueuedCommands() {
-  return db.mutationQueue.orderBy('createdAt').toArray();
+  const storeId = await getActiveStoreId();
+  if (!storeId) return [];
+  const items = await db.mutationQueue.where('storeId').equals(storeId).toArray();
+  return items.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 }
 
 export async function getMutationQueueSummary() {

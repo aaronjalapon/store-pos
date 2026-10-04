@@ -1,4 +1,4 @@
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { CopyObjectCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ObjectStorage } from './object-storage';
@@ -26,6 +26,10 @@ export class S3ObjectStorage extends ObjectStorage {
     await this.client.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: contentType }));
   }
 
+  async check() {
+    await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
+  }
+
   async get(key: string) {
     try {
       const response = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
@@ -43,5 +47,15 @@ export class S3ObjectStorage extends ObjectStorage {
 
   async delete(key: string) {
     await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+  }
+
+  async copy(sourceKey: string, destinationKey: string, contentType?: string) {
+    await this.client.send(new CopyObjectCommand({
+      Bucket: this.bucket,
+      Key: destinationKey,
+      CopySource: `${this.bucket}/${encodeURIComponent(sourceKey).replace(/%2F/g, '/')}`,
+      ContentType: contentType,
+      MetadataDirective: contentType ? 'REPLACE' : 'COPY',
+    }));
   }
 }

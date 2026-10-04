@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getCachedConflictMessage, logout, requestSync, retryNeedsAttention } from '../lib/api';
+import { getCachedConflictMessage, listActivityLogs, logout, requestSync, retryNeedsAttention } from '../lib/api';
 import { db, getSession, removeLocalStoreData, saveSession } from '../lib/db';
 
 const now = new Date().toISOString();
@@ -26,11 +26,12 @@ describe('local data protection', () => {
     });
     await db.mutationQueue.add({
       id: 'command',
+      storeId: 'store',
       request: {
         clientCommandId: '00000000-0000-4000-8000-000000000001', baseCursor: 0,
         command: { type: 'createCustomer', payload: { name: 'Offline customer' } },
       },
-      createdAt: now, status: 'pending', attemptCount: 0, lastAttemptAt: null, errorMessage: null,
+      createdAt: now, status: 'pending', attemptCount: 0, lastAttemptAt: null, nextAttemptAt: null, errorMessage: null,
     });
   });
 
@@ -38,6 +39,74 @@ describe('local data protection', () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     await db.delete();
+  });
+
+  it('notifies connectivity only on failure and recovery transitions', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ activity: [], nextCursor: null })));
+    vi.stubGlobal('fetch', fetchMock);
+    await listActivityLogs(); // Establish a reachable baseline regardless of preceding tests.
+    const changed = vi.fn();
+    window.addEventListener('pos-sync-state-changed', changed);
+    try {
+      fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch')).mockRejectedValueOnce(new TypeError('Failed to fetch'));
+      await expect(listActivityLogs()).rejects.toThrow('Failed to fetch');
+      await expect(listActivityLogs()).rejects.toThrow('Failed to fetch');
+      expect(changed).toHaveBeenCalledTimes(1);
+      await listActivityLogs();
+      await listActivityLogs();
+      expect(changed).toHaveBeenCalledTimes(2);
+    } finally {
+      window.removeEventListener('pos-sync-state-changed', changed);
+    }
+  });
+
+  it('emits one activity completion event per successful batch, including partial batches', async () => {
+    const original = (await db.mutationQueue.toArray())[0];
+    await db.mutationQueue.put({ ...original, id: 'second', createdAt: new Date(Date.parse(now) + 1).toISOString(),
+      request: { ...original.request, clientCommandId: crypto.randomUUID() } });
+    const changed = vi.fn();
+    window.addEventListener('pos-commands-synced', changed);
+    try {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ status: 'applied', cursor: 1 })))
+        .mockRejectedValueOnce(new TypeError('Failed to fetch')));
+      await requestSync();
+      expect(changed).toHaveBeenCalledTimes(1);
+      expect(await db.mutationQueue.count()).toBe(1);
+      vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(JSON.stringify({
+        cursor: 2, changes: [], tombstones: [], hasMore: false, historyWindowStart: now,
+      }))));
+      await db.mutationQueue.clear();
+      await requestSync();
+      expect(changed).toHaveBeenCalledTimes(1); // Empty sync is not a command completion.
+    } finally {
+      window.removeEventListener('pos-commands-synced', changed);
+    }
+  });
+
+  it('completes multiple queued commands with just one confirmed-activity refresh', async () => {
+    const original = (await db.mutationQueue.toArray())[0];
+    await db.mutationQueue.put({ ...original, id: 'second', createdAt: new Date(Date.parse(now) + 1).toISOString(),
+      request: { ...original.request, clientCommandId: crypto.randomUUID() } });
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => new Response(JSON.stringify(
+      url.includes('/commands') ? { status: 'applied', cursor: 2 } : {
+        cursor: 2, changes: [], tombstones: [], hasMore: false, historyWindowStart: now,
+      },
+    )));
+    vi.stubGlobal('fetch', fetchMock);
+    const completed = vi.fn();
+    const dataChanged = vi.fn();
+    window.addEventListener('pos-commands-synced', completed);
+    window.addEventListener('pos-data-changed', dataChanged);
+    try {
+      await requestSync();
+      expect(await db.mutationQueue.count()).toBe(0);
+      expect(completed).toHaveBeenCalledTimes(1);
+      expect(dataChanged).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(3); // Two commands and one empty delta.
+    } finally {
+      window.removeEventListener('pos-commands-synced', completed);
+      window.removeEventListener('pos-data-changed', dataChanged);
+    }
   });
 
   it('signs out without deleting cached sales or pending commands', async () => {
@@ -95,6 +164,7 @@ describe('local data protection', () => {
     });
     await db.mutationQueue.add({
       id: '00000000-0000-4000-8000-000000000102',
+      storeId: 'store',
       request: {
         clientCommandId: '00000000-0000-4000-8000-000000000102',
         baseCursor: 0,
@@ -104,6 +174,7 @@ describe('local data protection', () => {
       status: 'needs_attention',
       attemptCount: 1,
       lastAttemptAt: now,
+      nextAttemptAt: null,
       errorMessage: 'Invalid sync command: command.payload.productUnitId: Invalid UUID',
     });
     const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({

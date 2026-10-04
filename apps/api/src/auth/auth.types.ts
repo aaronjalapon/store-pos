@@ -1,6 +1,7 @@
 import type { Role } from '@gma/contracts';
 
 export interface SessionPrincipal {
+  sessionId?: string;
   userId: string;
   storeId: string;
   deviceId: string;

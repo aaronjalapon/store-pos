@@ -55,6 +55,8 @@ describe('runMigrations', () => {
 
     await expect(runMigrations('postgres://example', { connectRetries: 2, retryDelayMs: 0, onRetry })).resolves.toEqual({
       appliedCount: 0,
+      skippedCount: 0,
+      appliedFilenames: [],
       completed: true,
     });
 

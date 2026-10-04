@@ -215,17 +215,62 @@ interface StaffRow {
 export class StoreDataService {
   constructor(private readonly database: DatabaseService) {}
 
-  async loadSnapshot(storeId: string): Promise<StoreSnapshot> {
-    const [products, productUnits, sales, saleItems, inventoryMovements, customers, utangEntries, expenses, staff, qrPayments, paymentSettings] = await Promise.all([
-      this.database.query<ProductRow>('SELECT * FROM products WHERE store_id = $1 ORDER BY updated_at ASC, id ASC', [storeId]),
-      this.database.query<ProductUnitRow>('SELECT * FROM product_units WHERE store_id = $1 AND is_active = true ORDER BY product_id ASC, multiplier_base_units ASC, id ASC', [storeId]),
-      this.database.query<SaleRow>('SELECT * FROM sales WHERE store_id = $1 ORDER BY created_at ASC, id ASC', [storeId]),
-      this.database.query<SaleItemRow>('SELECT * FROM sale_items WHERE store_id = $1 ORDER BY created_at ASC, id ASC', [storeId]),
-      this.database.query<InventoryMovementRow>('SELECT * FROM inventory_movements WHERE store_id = $1 ORDER BY created_at ASC, id ASC', [storeId]),
-      this.database.query<CustomerRow>('SELECT * FROM customers WHERE store_id = $1 ORDER BY updated_at ASC, id ASC', [storeId]),
-      this.database.query<UtangEntryRow>('SELECT * FROM utang_entries WHERE store_id = $1 ORDER BY created_at ASC, id ASC', [storeId]),
-      this.database.query<ExpenseRow>('SELECT * FROM expenses WHERE store_id = $1 ORDER BY occurred_at ASC, id ASC', [storeId]),
-      this.database.query<StaffRow>(
+  loadBrowserSnapshot(storeId: string) {
+    return this.loadSnapshot(storeId, { historySince: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) });
+  }
+
+  async loadSnapshot(
+    storeId: string,
+    options: { historySince?: Date; includeInactiveUnits?: boolean; client?: Pick<DatabaseService, 'query'> } = {},
+  ): Promise<StoreSnapshot> {
+    const client = options.client ?? this.database;
+    const historySince = options.historySince?.toISOString() ?? null;
+    const [products, productUnits, sales, saleItems, inventoryMovements, customers, utangEntries, expenses, staff, qrPayments, paymentSettings] = [
+      await client.query<ProductRow>('SELECT * FROM products WHERE store_id = $1 ORDER BY updated_at ASC, id ASC', [storeId]),
+      await client.query<ProductUnitRow>(
+        `SELECT * FROM product_units
+          WHERE store_id = $1 AND ($2::boolean OR is_active = true)
+          ORDER BY product_id ASC, multiplier_base_units ASC, id ASC`,
+        [storeId, options.includeInactiveUnits === true],
+      ),
+      await client.query<SaleRow>(
+        `SELECT * FROM sales sale
+          WHERE sale.store_id = $1 AND (
+            $2::timestamptz IS NULL OR sale.created_at >= $2 OR EXISTS (
+              SELECT 1 FROM utang_entries debt
+               WHERE debt.store_id = sale.store_id AND debt.sale_id = sale.id
+            )
+          ) ORDER BY sale.created_at ASC, sale.id ASC`,
+        [storeId, historySince],
+      ),
+      await client.query<SaleItemRow>(
+        `SELECT item.* FROM sale_items item
+          JOIN sales sale ON sale.id = item.sale_id AND sale.store_id = item.store_id
+         WHERE item.store_id = $1 AND (
+           $2::timestamptz IS NULL OR sale.created_at >= $2 OR EXISTS (
+             SELECT 1 FROM utang_entries debt
+              WHERE debt.store_id = sale.store_id AND debt.sale_id = sale.id
+           )
+         ) ORDER BY item.created_at ASC, item.id ASC`,
+        [storeId, historySince],
+      ),
+      await client.query<InventoryMovementRow>(
+        `SELECT movement.* FROM inventory_movements movement
+         WHERE movement.store_id = $1 AND (
+           $2::timestamptz IS NULL OR movement.created_at >= $2 OR EXISTS (
+             SELECT 1 FROM utang_entries debt
+              WHERE debt.store_id = movement.store_id AND debt.sale_id = movement.sale_id
+           )
+         ) ORDER BY movement.created_at ASC, movement.id ASC`,
+        [storeId, historySince],
+      ),
+      await client.query<CustomerRow>('SELECT * FROM customers WHERE store_id = $1 ORDER BY updated_at ASC, id ASC', [storeId]),
+      await client.query<UtangEntryRow>('SELECT * FROM utang_entries WHERE store_id = $1 ORDER BY created_at ASC, id ASC', [storeId]),
+      await client.query<ExpenseRow>(
+        'SELECT * FROM expenses WHERE store_id = $1 AND ($2::timestamptz IS NULL OR occurred_at >= $2) ORDER BY occurred_at ASC, id ASC',
+        [storeId, historySince],
+      ),
+      await client.query<StaffRow>(
         `SELECT users.id, users.display_name, users.email, users.staff_code,
                 store_memberships.role, (users.is_active AND store_memberships.is_active) AS is_active,
                 users.created_at, users.updated_at
@@ -235,9 +280,19 @@ export class StoreDataService {
           ORDER BY CASE store_memberships.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, users.display_name ASC`,
         [storeId],
       ),
-      this.database.query<QrPaymentRow>('SELECT * FROM qr_payments WHERE store_id = $1 ORDER BY confirmed_at ASC, id ASC', [storeId]),
-      this.database.query<QrPhPaymentSettingsRow>('SELECT store_id, image_revision, content_type, byte_length, updated_at FROM qrph_payment_settings WHERE store_id = $1', [storeId]),
-    ]);
+      await client.query<QrPaymentRow>(
+        `SELECT payment.* FROM qr_payments payment
+          JOIN sales sale ON sale.id = payment.sale_id AND sale.store_id = payment.store_id
+         WHERE payment.store_id = $1 AND (
+           $2::timestamptz IS NULL OR sale.created_at >= $2 OR EXISTS (
+             SELECT 1 FROM utang_entries debt
+              WHERE debt.store_id = sale.store_id AND debt.sale_id = sale.id
+           )
+         ) ORDER BY payment.confirmed_at ASC, payment.id ASC`,
+        [storeId, historySince],
+      ),
+      await client.query<QrPhPaymentSettingsRow>('SELECT store_id, image_revision, content_type, byte_length, updated_at FROM qrph_payment_settings WHERE store_id = $1', [storeId]),
+    ];
 
     return {
       products: products.rows.map((row) => this.mapProduct(row)),
@@ -254,8 +309,19 @@ export class StoreDataService {
     };
   }
 
-  async currentCursor(storeId: string) {
-    const result = await this.database.query<{ cursor: string }>(
+  async loadSyncSnapshot(storeId: string, browserHistory = false) {
+    return this.database.transaction(async (client) => {
+      await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const snapshot = await this.loadSnapshot(storeId, {
+        client,
+        ...(browserHistory ? { historySince: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } : {}),
+      });
+      return { snapshot, cursor: await this.currentCursor(storeId, client) };
+    });
+  }
+
+  async currentCursor(storeId: string, client: Pick<DatabaseService, 'query'> = this.database) {
+    const result = await client.query<{ cursor: string }>(
       'SELECT COALESCE(MAX(id), 0)::text AS cursor FROM sync_events WHERE store_id = $1',
       [storeId],
     );
@@ -263,7 +329,83 @@ export class StoreDataService {
   }
 
   async createSyncEvent(client: { query: DatabaseService['query'] }, storeId: string, kind: string) {
-    await client.query('INSERT INTO sync_events (store_id, kind) VALUES ($1, $2)', [storeId, kind]);
+    await client.query(
+      `WITH event AS (
+         INSERT INTO sync_events (store_id, kind) VALUES ($1, $2) RETURNING id
+       )
+       INSERT INTO entity_changes (store_id, sync_cursor, entity_type, entity_id, operation)
+       SELECT $1, id, $2, '*', 'upsert' FROM event`,
+      [storeId, kind],
+    );
+  }
+
+  async loadDelta(storeId: string, afterCursor: number) {
+    const [changes, retention] = await Promise.all([this.database.query<{
+      id: string;
+      entity_type: string;
+      entity_id: string;
+      operation: 'upsert' | 'delete';
+      changed_at: Date;
+    }>(
+      `SELECT sync_cursor::text AS id, entity_type, entity_id, operation, changed_at
+         FROM entity_changes
+        WHERE store_id = $1 AND sync_cursor > $2
+        ORDER BY sync_cursor ASC
+        LIMIT 501`,
+      [storeId, afterCursor],
+    ), this.database.query<{ min_available_cursor: string }>(
+      'SELECT min_available_cursor::text FROM store_sync_state WHERE store_id = $1',
+      [storeId],
+    )]);
+    const minAvailableCursor = Number(retention.rows[0]?.min_available_cursor ?? '0');
+    if (afterCursor > 0 && afterCursor < minAvailableCursor) {
+      return {
+        cursor: afterCursor,
+        changes: [],
+        tombstones: [],
+        hasMore: false,
+        fullResyncRequired: true,
+      };
+    }
+    const page = changes.rows.slice(0, 500);
+    const mapped = page.map((row) => ({
+      cursor: Number(row.id), entityType: row.entity_type, entityId: row.entity_id,
+      operation: row.operation, changedAt: row.changed_at.toISOString(),
+    }));
+    return {
+      cursor: mapped.at(-1)?.cursor ?? afterCursor,
+      changes: mapped.filter((change) => change.operation === 'upsert'),
+      tombstones: mapped.filter((change) => change.operation === 'delete'),
+      hasMore: changes.rows.length > 500,
+      fullResyncRequired: false,
+    };
+  }
+
+  async loadDeltaPatch(storeId: string, entityTypes: string[]): Promise<Partial<StoreSnapshot>> {
+    const types = new Set(entityTypes);
+    const snapshot = await this.loadBrowserSnapshot(storeId);
+    if (types.has('legacy_import')) return snapshot;
+
+    const patch: Partial<StoreSnapshot> = {};
+    const includeProducts = types.has('product') || types.has('inventory') || types.has('sale');
+    if (includeProducts) {
+      patch.products = snapshot.products;
+      patch.productUnits = snapshot.productUnits;
+    }
+    if (types.has('inventory') || types.has('sale')) patch.inventoryMovements = snapshot.inventoryMovements;
+    if (types.has('sale')) {
+      patch.sales = snapshot.sales;
+      patch.saleItems = snapshot.saleItems;
+      patch.customers = snapshot.customers;
+      patch.utangEntries = snapshot.utangEntries;
+      patch.qrPayments = snapshot.qrPayments;
+    }
+    if (types.has('customer') || types.has('utang_payment')) patch.customers = snapshot.customers;
+    if (types.has('utang_payment')) patch.utangEntries = snapshot.utangEntries;
+    if (types.has('expense')) patch.expenses = snapshot.expenses;
+    if (types.has('qr_payment_review')) patch.qrPayments = snapshot.qrPayments;
+    if (types.has('payment_settings')) patch.paymentSettings = snapshot.paymentSettings ?? null;
+    return patch;
   }
 
   async isStoreEmpty(storeId: string) {

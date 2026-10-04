@@ -24,7 +24,7 @@ describe('PosService command idempotency', () => {
       transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
     };
     const data = {
-      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
       currentCursor: jest.fn().mockResolvedValue(12),
       createSyncEvent: jest.fn(),
     };
@@ -61,7 +61,7 @@ describe('PosService command idempotency', () => {
       transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
     };
     const data = {
-      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
       currentCursor: jest.fn().mockResolvedValue(13),
       createSyncEvent: jest.fn().mockResolvedValue(undefined),
     };
@@ -75,6 +75,87 @@ describe('PosService command idempotency', () => {
     expect(database.transaction).toHaveBeenCalledTimes(1);
     expect(data.createSyncEvent).toHaveBeenCalledTimes(1);
     expect(client.query.mock.calls[3][0]).toContain('UPDATE processed_commands');
+  });
+});
+
+describe('PosService sale integrity', () => {
+  const productId = '00000000-0000-4000-8000-000000000071';
+  const otherProductId = '00000000-0000-4000-8000-000000000072';
+  const unitId = '00000000-0000-4000-8000-000000000073';
+  const productRow = {
+    id: productId, store_id: principal.storeId, name: 'Rice', unit: 'piece', barcode: null, sku: null,
+    image_revision: null, cost_price: 500, selling_price: 700, stock_quantity: 10,
+    sold_by_weight: false, quantity_step: 1, low_stock_threshold: 2, is_quick_item: true,
+    is_active: true, record_version: 1, created_at: new Date(), updated_at: new Date(),
+    base_unit: 'piece', base_unit_id: null, stock_base_quantity: 10, low_stock_base_threshold: 2,
+    default_sale_unit_id: null, default_restock_unit_id: null, display_unit_id: null,
+  };
+
+  function request(cart: Array<{ productId: string; quantity: number; expectedVersion: number; productUnitId?: string; inputQuantity?: number }>): StoreCommandRequest {
+    return {
+      clientCommandId: crypto.randomUUID(), baseCursor: 0,
+      command: {
+        type: 'completeSale',
+        payload: {
+          saleId: crypto.randomUUID(), transactionNumber: 'POS-TEST', occurredAt: new Date().toISOString(),
+          paymentMethod: 'cash', cashReceived: 10_000, customerId: null, cart,
+        },
+      },
+    };
+  }
+
+  function serviceWith(client: { query: jest.Mock }) {
+    const database = {
+      query: jest.fn().mockResolvedValue({ rows: [{ first_synced_at: new Date() }] }),
+      transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
+    };
+    const data = { loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot), currentCursor: jest.fn().mockResolvedValue(20), createSyncEvent: jest.fn() };
+    return { service: new PosService(database as never, data as never), data };
+  }
+
+  it('rejects a selling unit owned by another product', async () => {
+    const client = { query: jest.fn(async (sql: string, _parameters?: unknown[]) => {
+      if (sql.includes('INSERT INTO processed_commands')) return { rows: [{ client_command_id: 'claim' }] };
+      if (sql.includes('SELECT * FROM products')) return { rows: [productRow] };
+      if (sql.includes('SELECT * FROM product_units')) return { rows: [{
+        id: unitId, store_id: principal.storeId, product_id: otherProductId, name: 'case', symbol: 'case',
+        multiplier_base_units: 24, quantity_step: 1, can_sell: true, can_restock: true,
+        allow_amount_pricing: false, selling_price: 12_000, cost_price: 10_000, barcode: null,
+        is_base: false, is_active: true, replaces_unit_id: null, record_version: 1, created_at: new Date(), updated_at: new Date(),
+      }] };
+      return { rows: [] };
+    }) };
+    const { service } = serviceWith(client);
+    await expect(service.applyCommand(principal, request([{ productId, productUnitId: unitId, inputQuantity: 1, quantity: 1, expectedVersion: 1 }]))).resolves.toMatchObject({ status: 'conflict', reason: 'unit_product_mismatch' });
+    expect(client.query.mock.calls.some(([sql]) => String(sql).includes('INSERT INTO sales'))).toBe(false);
+  });
+
+  it('aggregates duplicate legacy lines before checking stock', async () => {
+    const client = { query: jest.fn(async (sql: string, _parameters?: unknown[]) => {
+      if (sql.includes('INSERT INTO processed_commands')) return { rows: [{ client_command_id: 'claim' }] };
+      if (sql.includes('SELECT * FROM products')) return { rows: [{ ...productRow, stock_quantity: 5, stock_base_quantity: 5 }] };
+      return { rows: [] };
+    }) };
+    const { service } = serviceWith(client);
+    await expect(service.applyCommand(principal, request([
+      { productId, quantity: 3, expectedVersion: 1 }, { productId, quantity: 3, expectedVersion: 1 },
+    ]))).resolves.toMatchObject({ status: 'conflict', reason: 'stale_product' });
+    expect(client.query.mock.calls.some(([sql]) => String(sql).includes('UPDATE products'))).toBe(false);
+  });
+
+  it('updates each product stock balance exactly once for duplicate lines', async () => {
+    const client = { query: jest.fn(async (sql: string, _parameters?: unknown[]) => {
+      if (sql.includes('INSERT INTO processed_commands')) return { rows: [{ client_command_id: 'claim' }] };
+      if (sql.includes('SELECT * FROM products')) return { rows: [productRow] };
+      return { rows: [] };
+    }) };
+    const { service } = serviceWith(client);
+    await expect(service.applyCommand(principal, request([
+      { productId, quantity: 2, expectedVersion: 1 }, { productId, quantity: 2, expectedVersion: 1 },
+    ]))).resolves.toMatchObject({ status: 'applied' });
+    const updates = client.query.mock.calls.filter(([sql]) => String(sql).includes('UPDATE products'));
+    expect(updates).toHaveLength(1);
+    expect(updates[0][1]).toEqual([productId, principal.storeId, 6, expect.any(String), principal.userId, 6]);
   });
 });
 
@@ -107,7 +188,7 @@ describe('PosService protected stock adjustment', () => {
   it('requires a command-bound manager approval before touching stock', async () => {
     const database = { query: jest.fn().mockResolvedValue({ rows: [{ first_synced_at: null }] }) };
     const data = {
-      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
       currentCursor: jest.fn().mockResolvedValue(0),
     };
     const auth = { verifyManagerActionProof: jest.fn().mockResolvedValue(undefined) };
@@ -135,7 +216,7 @@ describe('PosService product persistence', () => {
       transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
     };
     const data = {
-      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
       currentCursor: jest.fn().mockResolvedValue(14),
       createSyncEvent: jest.fn().mockResolvedValue(undefined),
     };
@@ -189,7 +270,7 @@ describe('PosService product persistence', () => {
       transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
     };
     const data = {
-      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
       currentCursor: jest.fn().mockResolvedValue(15),
       createSyncEvent: jest.fn().mockResolvedValue(undefined),
     };
@@ -224,7 +305,7 @@ describe('PosService product persistence', () => {
       transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
     };
     const data = {
-      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
       currentCursor: jest.fn().mockResolvedValue(16),
       createSyncEvent: jest.fn(),
     };
@@ -273,7 +354,7 @@ describe('PosService canonical inventory receiving', () => {
       transaction: jest.fn(async (work: (value: typeof client) => Promise<unknown>) => work(client)),
     };
     const data = {
-      loadSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue(emptySnapshot),
       currentCursor: jest.fn().mockResolvedValue(17),
       createSyncEvent: jest.fn().mockResolvedValue(undefined),
     };

@@ -116,9 +116,10 @@ export function PosApp({ session, onLogout }: { session: StoreAuthSession; onLog
     setOnline(navigator.onLine);
     void navigator.storage?.persist?.();
     if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
-    const changed = () => {
+    const changed = (event: Event) => {
       void load();
       loadSyncState();
+      if ((event as CustomEvent<{ source?: string }>).detail?.source === 'server') return;
       clearTimeout(syncTimer);
       syncTimer = setTimeout(() => void requestSync(), 500);
     };
@@ -261,6 +262,51 @@ export function SellView({ products, productUnits = [], customers, allowProductC
   const [newProductBarcode, setNewProductBarcode] = useState<string | null>(null);
   const [cartIssues, setCartIssues] = useState<Record<string, string>>({});
   const barcodeCallback = useRef<(code: string) => void>(() => undefined);
+  const cartRef = useRef<HTMLElement>(null);
+  const cartTriggerRef = useRef<HTMLButtonElement>(null);
+  const productPaneRef = useRef<HTMLElement>(null);
+  const actionDockRef = useRef<HTMLDivElement>(null);
+  const [mobileCart, setMobileCart] = useState(false);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia('(max-width: 699px)');
+    const update = () => setMobileCart(query.matches);
+    update();
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+
+  useEffect(() => {
+    if (!cartOpen || !mobileCart) return;
+    const cartElement = cartRef.current;
+    if (!cartElement) return;
+    productPaneRef.current && (productPaneRef.current.inert = true);
+    actionDockRef.current && (actionDockRef.current.inert = true);
+    const focusable = () => [...cartElement.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+    focusable()[0]?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setCartOpen(false);
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const elements = focusable();
+      if (!elements.length) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    cartElement.addEventListener('keydown', onKeyDown);
+    return () => {
+      cartElement.removeEventListener('keydown', onKeyDown);
+      if (productPaneRef.current) productPaneRef.current.inert = false;
+      if (actionDockRef.current) actionDockRef.current.inert = false;
+      cartTriggerRef.current?.focus();
+    };
+  }, [cartOpen, mobileCart]);
 
   const activeProducts = useMemo(() => products.filter((product) => product.isActive), [products]);
   const matching = useMemo(() => {
@@ -386,7 +432,7 @@ export function SellView({ products, productUnits = [], customers, allowProductC
 
   return (
     <div className="sell-layout">
-      <section className="product-pane">
+      <section className="product-pane" ref={productPaneRef}>
         <div className="page-intro"><p className="eyebrow">SELL ITEMS</p><h1>What are we selling?</h1><p>Search, scan, or tap a favorite.</p></div>
         <div className="search-row sell-search-row">
           <label className="search-box"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search products…" autoComplete="off" /></label>
@@ -398,14 +444,14 @@ export function SellView({ products, productUnits = [], customers, allowProductC
         {!query && <><div className="section-title"><span>QUICK ITEMS</span><small>One tap to add</small></div><div className="quick-grid">{quickItems.map((product, index) => { const outOfStock = product.stockQuantity <= 0; const lowStock = !outOfStock && product.stockQuantity <= product.lowStockThreshold; return <button key={product.id} disabled={outOfStock} className={`quick-card tone-${index % 5}${outOfStock ? ' out-of-stock' : ''}${lowStock ? ' low-stock' : ''}`} onClick={() => addProduct(product)}><ProductThumbnail product={product} className="quick-image" /><strong>{product.name}</strong><span>{formatPeso(product.sellingPrice)}{product.soldByWeight ? ` / ${product.unit}` : ''}</span><small className="availability-label">{outOfStock ? <><AlertTriangle /> Out of stock</> : lowStock ? <><AlertTriangle /> Low stock · {formatQuantity(product.stockQuantity)} {product.unit}</> : `${formatQuantity(product.stockQuantity)} ${product.unit}`}</small></button>; })}</div></>}
       </section>
       {cartOpen && <button className="mobile-cart-backdrop" aria-label="Close cart" onClick={() => setCartOpen(false)} />}
-      <aside className={`cart-pane ${cartOpen ? 'mobile-open' : ''}`} aria-label="Current sale">
+      <aside ref={cartRef} className={`cart-pane ${cartOpen ? 'mobile-open' : ''}`} aria-label="Current sale" role={mobileCart ? 'dialog' : undefined} aria-modal={mobileCart ? true : undefined}>
         <div className="cart-heading"><div><p className="eyebrow">CURRENT SALE</p><h2>Cart <span>{cart.length}</span></h2></div><div className="cart-heading-actions">{cart.length > 0 && <button onClick={() => { setCart([]); setCartIssues({}); }}><Trash2 size={17} /> Clear</button>}<button className="icon-button mobile-cart-close" onClick={() => setCartOpen(false)} aria-label="Close cart"><X /></button></div></div>
         {cart.length === 0 ? <div className="empty-cart"><ShoppingBasket /><strong>Your cart is ready</strong><p>Add an item to begin a sale.</p></div> : <div className="cart-lines">{cart.map((line) => { const step = line.unit?.quantityStep ?? productQuantityStep(line.product); const units = unitsByProduct.get(line.product.id)?.filter((unit) => unit.isActive && unit.canSell) ?? []; const unitId = line.unit?.id ?? null; const price = line.unit?.sellingPrice ?? line.product.sellingPrice; return <div className={`cart-line ${line.product.soldByWeight ? 'weighted' : ''}`} key={`${line.product.id}:${unitId ?? 'legacy'}`}><div><strong>{line.product.name}</strong>{units.length > 1 ? <select aria-label={`${line.product.name} selling unit`} value={unitId ?? ''} onChange={(event) => { const next = units.find((unit) => unit.id === event.target.value); if (next) switchLineUnit(line.product.id, unitId, next); }}>{units.map((unit) => <option key={unit.id} value={unit.id}>{unit.name} · {formatPeso(unit.sellingPrice ?? 0)}</option>)}</select> : <span>{formatPeso(price)} / {line.unit?.name ?? line.product.unit}</span>}</div>{line.product.soldByWeight || line.unit?.allowAmountPricing ? <WeightedLineEditor line={{ ...line, product: { ...line.product, sellingPrice: price, unit: line.unit?.name ?? line.product.unit, quantityStep: line.unit?.quantityStep ?? line.product.quantityStep, soldByWeight: line.unit?.allowAmountPricing ?? line.product.soldByWeight } }} issue={cartIssues[line.product.id]} onModeChange={(mode) => setPricingMode(line.product.id, mode, unitId)} onWeightChange={(quantity) => setProductQuantity(line.product.id, quantity, unitId)} onAmountChange={(amount) => setProductAmount(line.product.id, amount, unitId)} /> : <div className="quantity-stepper"><button aria-label={`Decrease ${line.product.name}`} onClick={() => setProductQuantity(line.product.id, line.quantity - step, unitId)}><Minus /></button><strong>{line.quantity}</strong><button aria-label={`Increase ${line.product.name}`} onClick={() => setProductQuantity(line.product.id, line.quantity + step, unitId)}><Plus /></button></div>}<b>{formatPeso(lineSubtotal(line))}</b></div>; })}</div>}
         <div className="cart-total"><span>Total</span><strong>{formatPeso(total)}</strong><button className="checkout-button" disabled={!cart.length || hasCartIssues} onClick={() => { setCartOpen(false); setCheckout(true); }}>CHECKOUT <span>{formatPeso(total)}</span></button><small><Check /> Saved on this phone, even offline</small></div>
       </aside>
-      <div className={`phone-action-dock sell-action-dock ${cart.length ? 'has-cart' : 'empty-cart-dock'}`} aria-label="Sell actions">
+      <div ref={actionDockRef} className={`phone-action-dock sell-action-dock ${cart.length ? 'has-cart' : 'empty-cart-dock'}`} aria-label="Sell actions">
         <button type="button" className="dock-scan-button" aria-label="Scan product barcode" onClick={() => setScanner(true)}><Camera /><span>Scan</span></button>
-        {cart.length > 0 && <button type="button" className="dock-cart-button" aria-label={`${cart.length} ${cart.length === 1 ? 'product' : 'products'} in cart, ${formatPeso(total)} total. View cart`} onClick={() => setCartOpen(true)}><span><ShoppingBasket /><b>{cart.length}</b></span><span><strong>View Cart</strong><small>{cart.length} {cart.length === 1 ? 'item' : 'items'} · Total</small></span><strong>{formatPeso(total)}</strong><ChevronDown /></button>}
+        {cart.length > 0 && <button ref={cartTriggerRef} type="button" className="dock-cart-button" aria-label={`${cart.length} ${cart.length === 1 ? 'product' : 'products'} in cart, ${formatPeso(total)} total. View cart`} onClick={() => setCartOpen(true)}><span><ShoppingBasket /><b>{cart.length}</b></span><span><strong>View Cart</strong><small>{cart.length} {cart.length === 1 ? 'item' : 'items'} · Total</small></span><strong>{formatPeso(total)}</strong><ChevronDown /></button>}
       </div>
       {checkout && <CheckoutModal total={total} customers={customers} onClose={() => setCheckout(false)} onComplete={async (paymentMethod, cashReceived, customerId, qrPayment) => {
         const result = await completeSale({ cart, paymentMethod, cashReceived, customerId, qrPayment });

@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import type { AuthSession } from '@gma/contracts';
 import { AlertTriangle, KeyRound, ShieldCheck, Store, Users } from 'lucide-react';
-import { fetchSetupStatus, isInvalidSessionError, loginCashier, loginOwner, logout, rehydrateSession, setupOwner } from '../lib/api';
+import { ApiRequestError, fetchSetupStatus, isInvalidSessionError, loginCashier, loginOwner, logout, rehydrateSession, setupOwner } from '../lib/api';
 import { getActiveStoreId, getSession, hasCompletedBootstrap, signOutLocally } from '../lib/db';
 import { PosApp } from './pos-app';
 import { SuperadminConsole } from './superadmin-console';
@@ -120,7 +120,12 @@ export function AuthShell() {
       setOfflineReady(true);
       if (next.store) setKnownStoreId(next.store.id);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Something went wrong');
+      if (error instanceof ApiRequestError && error.status === 428) {
+        const body = error.body as { code?: string; challengeId?: string; expiresAt?: string } | undefined;
+        setMessage(body?.code === 'device_enrollment_required'
+          ? `This browser is waiting for owner approval${body.expiresAt ? ` until ${new Date(body.expiresAt).toLocaleTimeString('en-PH')}` : ''}. Ask an owner or superadmin to approve “${body.challengeId?.slice(0, 8) ?? 'this request'}”, then sign in again.`
+          : error.message);
+      } else setMessage(error instanceof Error ? error.message : 'Something went wrong');
     } finally {
       setBusy(false);
     }

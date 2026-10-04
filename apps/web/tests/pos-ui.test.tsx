@@ -1,7 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { StoreAuthSession } from '@gma/contracts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CheckoutModal, ProductForm } from '../components/pos-app';
-import { db, saveSession } from '../lib/db';
+import { CheckoutModal, PosApp, ProductForm } from '../components/pos-app';
+import * as apiModule from '../lib/api';
+import { db, getSession, saveSession } from '../lib/db';
 
 const now = new Date().toISOString();
 
@@ -19,7 +21,26 @@ describe('POS modal interactions', () => {
 
   afterEach(async () => {
     cleanup();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     await db.delete();
+  });
+
+  it('reloads server changes without syncing again while legacy and explicit local changes sync', async () => {
+    const sync = vi.spyOn(apiModule, 'requestSync').mockResolvedValue(undefined);
+    render(<PosApp session={(await getSession()) as StoreAuthSession} onLogout={vi.fn()} />);
+    await screen.findByRole('heading', { name: 'What are we selling?' });
+    expect(sync).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    act(() => { window.dispatchEvent(new CustomEvent('pos-data-changed', { detail: { source: 'server' } })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    expect(sync).toHaveBeenCalledTimes(1);
+    act(() => { window.dispatchEvent(new CustomEvent('pos-data-changed', { detail: { source: 'local' } })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    expect(sync).toHaveBeenCalledTimes(2);
+    act(() => { window.dispatchEvent(new Event('pos-data-changed')); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    expect(sync).toHaveBeenCalledTimes(3);
   });
 
   it('creates and selects a customer inline for Utang checkout', async () => {
@@ -41,7 +62,7 @@ describe('POS modal interactions', () => {
     const revision = '00000000-0000-4000-8000-000000000099';
     const blob = new Blob(['qr-image'], { type: 'image/png' });
     await db.paymentSettings.put({ storeId: 'store', imageRevision: revision, contentType: 'image/png', byteLength: blob.size, updatedAt: now });
-    await db.qrPhImages.put({ key: 'qrph', revision, blob, contentType: 'image/png', byteLength: blob.size, updatedAt: now });
+    await db.qrPhImages.put({ key: 'qrph', storeId: 'store', revision, blob, contentType: 'image/png', byteLength: blob.size, updatedAt: now });
     render(<CheckoutModal total={2500} customers={[]} onClose={vi.fn()} onComplete={vi.fn()} />);
     const onlinePayment = await screen.findByRole('radio', { name: 'ONLINE PAYMENT' });
     await waitFor(() => expect((onlinePayment as HTMLButtonElement).disabled).toBe(false));

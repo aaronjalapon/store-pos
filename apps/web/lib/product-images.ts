@@ -72,7 +72,7 @@ export async function flushProductImageUploads() {
   const configuration = await getImageConfiguration();
   if (!configuration || !navigator.onLine) return false;
   const uploads = await db.productImageQueue.where('operation').equals('upload').toArray();
-  for (const item of uploads) {
+  for (const item of uploads.filter((candidate) => candidate.storeId === configuration.storeId)) {
     const image = await db.productImages.get(item.productId);
     if (!image || image.revision !== item.revision) {
       await db.productImageQueue.delete(item.id);
@@ -101,7 +101,7 @@ export async function flushProductImageDeletes() {
   const configuration = await getImageConfiguration();
   if (!configuration || !navigator.onLine) return;
   const deletions = await db.productImageQueue.where('operation').equals('delete').toArray();
-  for (const item of deletions) {
+  for (const item of deletions.filter((candidate) => candidate.storeId === configuration.storeId)) {
     try {
       const response = await fetch(imageUrl(configuration.apiUrl, configuration.storeId, item.productId, item.revision), {
         method: 'DELETE',
@@ -130,6 +130,7 @@ export async function hydrateProductImage(product: Product) {
   if (!['image/webp', 'image/jpeg'].includes(blob.type) || blob.size > MAX_IMAGE_BYTES) return null;
   const record = {
     productId: product.id,
+    storeId: configuration.storeId,
     revision: product.imageRevision,
     blob,
     contentType: blob.type as 'image/webp' | 'image/jpeg',

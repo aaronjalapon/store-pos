@@ -89,7 +89,11 @@ export class PosService {
     @Optional() private readonly activity?: ActivityService,
   ) {}
 
-  async applyCommand(principal: SessionPrincipal, request: StoreCommandRequest): Promise<StoreCommandResponse> {
+  async applyCommand(
+    principal: SessionPrincipal,
+    request: StoreCommandRequest,
+    includeSnapshot = true,
+  ): Promise<StoreCommandResponse> {
     const actor = await this.resolveCommandActor(principal, request);
     if (request.command.type === 'adjustStock') {
       this.requireRole(actor, ['owner', 'admin']);
@@ -101,7 +105,7 @@ export class PosService {
       [actor.deviceId, actor.storeId],
     );
     if (!bootstrapped.rows[0]?.first_synced_at) {
-      return this.conflict(actor.storeId, 'device_not_bootstrapped', 'This browser must finish its first sync before it can save offline work.');
+      return this.conflict(actor.storeId, 'device_not_bootstrapped', 'This browser must finish its first sync before it can save offline work.', includeSnapshot);
     }
 
     try {
@@ -181,12 +185,12 @@ export class PosService {
         );
         return commandResult;
       });
-      const snapshot = await this.data.loadSnapshot(actor.storeId);
       const cursor = await this.data.currentCursor(actor.storeId);
-      return { status: 'applied', cursor, snapshot, ...result };
+      const snapshot = includeSnapshot ? await this.data.loadBrowserSnapshot(actor.storeId) : undefined;
+      return { status: 'applied', cursor, ...(snapshot ? { snapshot } : {}), ...result };
     } catch (error) {
       if (error instanceof StaleConflict) {
-        return this.conflict(actor.storeId, error.reason, error.message);
+        return this.conflict(actor.storeId, error.reason, error.message, includeSnapshot);
       }
       throw error;
     }
@@ -371,8 +375,24 @@ export class PosService {
       }
       const unit = line.productUnitId ? units.get(line.productUnitId) : undefined;
       if (line.productUnitId && !unit) throw new StaleConflict('not_found', 'One of the selected selling units is no longer available.');
+      if (unit && unit.product_id !== product.id) {
+        throw new StaleConflict('unit_product_mismatch', `${unit.name} does not belong to ${product.name}.`);
+      }
+      if (unit && (!unit.is_active || !unit.can_sell)) {
+        throw new StaleConflict('inactive_unit', `${unit.name} is no longer available for sale.`);
+      }
       return unit ? this.prepareCanonicalSaleLine(product, unit, line) : this.prepareSaleLine(product, line);
     });
+    const requestedByProduct = new Map<string, number>();
+    for (const line of preparedLines) {
+      requestedByProduct.set(line.product.id, (requestedByProduct.get(line.product.id) ?? 0) + line.baseQuantity);
+    }
+    for (const [productId, requested] of requestedByProduct) {
+      const product = products.get(productId)!;
+      if (requested > this.currentBaseStock(product)) {
+        throw new StaleConflict('stale_product', `Only ${this.currentBaseStock(product)} base units of ${product.name} remain.`);
+      }
+    }
     const subtotal = preparedLines.reduce((sum, line) => sum + line.subtotal, 0);
     const discount = 0;
     const total = subtotal - discount;
@@ -407,56 +427,47 @@ export class PosService {
       const requestedReason: QrPayment['attentionReason'] = qr.confirmationSource === 'customer_proof'
         ? 'customer_proof'
         : null;
-      const inserted = await client.query(
+      await client.query(
         `INSERT INTO qr_payments
          (id, store_id, sale_id, cashier_user_id, cashier_display_name_snapshot, device_id, amount, reference, normalized_reference,
           confirmation_source, status, attention_reason, confirmed_at, record_version, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $13, $13)
-         ON CONFLICT (store_id, normalized_reference)
-         WHERE status IN ('merchant_confirmed', 'verified') DO NOTHING
-         RETURNING id`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending_review', $11, $12, 1, $12, $12)`,
         [qr.id, principal.storeId, saleId, principal.userId, principal.displayName, principal.deviceId, total, qr.reference.trim(), normalizedReference,
-          qr.confirmationSource, requestedStatus, requestedReason, now],
+          qr.confirmationSource, requestedReason, now],
       );
-      if (inserted.rows[0]) {
+      const claim = await client.query(
+        `INSERT INTO qr_reference_claims (store_id, normalized_reference, first_qr_payment_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (store_id, normalized_reference) DO NOTHING
+         RETURNING first_qr_payment_id`,
+        [principal.storeId, normalizedReference, qr.id],
+      );
+      if (claim.rows[0]) {
+        await client.query(
+          'UPDATE qr_payments SET status = $2, attention_reason = $3, updated_at = $4 WHERE id = $1',
+          [qr.id, requestedStatus, requestedReason, now],
+        );
         qrPaymentStatus = requestedStatus;
       } else {
         await client.query(
-          `INSERT INTO qr_payments
-           (id, store_id, sale_id, cashier_user_id, cashier_display_name_snapshot, device_id, amount, reference, normalized_reference,
-            confirmation_source, status, attention_reason, confirmed_at, record_version, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending_review', 'duplicate_reference', $11, 1, $11, $11)`,
-          [qr.id, principal.storeId, saleId, principal.userId, principal.displayName, principal.deviceId, total, qr.reference.trim(), normalizedReference,
-            qr.confirmationSource, now],
+          `UPDATE qr_payments
+              SET status = 'pending_review', attention_reason = 'duplicate_reference', updated_at = $2
+            WHERE id = $1`,
+          [qr.id, now],
         );
         qrPaymentStatus = 'pending_review';
       }
     }
 
-    const canonicalRunning = new Map<string, number>();
+    const runningBase = new Map<string, number>();
     for (const line of preparedLines) {
       const product = line.product;
-      const isCanonical = Boolean(line.unit);
-      const stockAfterBase = isCanonical
-        ? (canonicalRunning.get(product.id) ?? this.currentBaseStock(product)) - line.baseQuantity!
-        : null;
-      if (isCanonical && stockAfterBase! < 0) {
+      const stockAfterBase = (runningBase.get(product.id) ?? this.currentBaseStock(product)) - line.baseQuantity;
+      if (stockAfterBase < 0) {
         throw new StaleConflict('stale_product', `Only ${this.currentBaseStock(product)} base units of ${product.name} remain.`);
       }
-      canonicalRunning.set(product.id, isCanonical ? stockAfterBase! : canonicalRunning.get(product.id) ?? this.currentBaseStock(product));
-      const stockAfter = isCanonical
-        ? this.normalizeQuantity(stockAfterBase! / this.legacyDisplayMultiplier(product))
-        : this.normalizeQuantity(product.stock_quantity - line.quantity);
-      await client.query(
-        `UPDATE products
-            SET stock_quantity = $3,
-                stock_base_quantity = COALESCE($6, stock_base_quantity),
-                record_version = record_version + 1,
-                updated_at = $4,
-                updated_by_user_id = $5
-          WHERE id = $1 AND store_id = $2`,
-        [product.id, principal.storeId, stockAfter, now, principal.userId, stockAfterBase],
-      );
+      runningBase.set(product.id, stockAfterBase);
+      const stockAfter = this.normalizeQuantity(stockAfterBase / this.legacyDisplayMultiplier(product));
       await client.query(
         `INSERT INTO sale_items
          (id, store_id, sale_id, product_id, product_name_snapshot, quantity, unit_price, cost_price_snapshot, subtotal, record_version, created_at, updated_at,
@@ -474,11 +485,26 @@ export class PosService {
           product_unit_id, input_mode, input_quantity, input_unit_snapshot, multiplier_base_units_snapshot, base_quantity_delta, stock_after_base, actor_display_name_snapshot)
          VALUES ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9, 1, $10, $10, $11, 'delta', $12, $13, $14, $15, $16, $17)`,
         [crypto.randomUUID(), principal.storeId, product.id, saleId,
-          isCanonical ? -line.baseQuantity! : -line.quantity, stockAfter, transactionNumber,
+          line.unit ? -line.baseQuantity : -line.quantity, stockAfter, transactionNumber,
           principal.userId, principal.deviceId, now, line.unit?.id ?? null,
           line.inputQuantity ?? line.quantity, line.unit?.name ?? product.unit,
-          line.unit?.multiplier_base_units ?? 1, isCanonical ? -line.baseQuantity! : -line.quantity,
-          isCanonical ? stockAfterBase : null, principal.displayName],
+          line.unit?.multiplier_base_units ?? 1, -line.baseQuantity,
+          stockAfterBase, principal.displayName],
+      );
+    }
+
+    for (const [productId, stockAfterBase] of runningBase) {
+      const product = products.get(productId)!;
+      const stockAfter = this.normalizeQuantity(stockAfterBase / this.legacyDisplayMultiplier(product));
+      await client.query(
+        `UPDATE products
+            SET stock_quantity = $3,
+                stock_base_quantity = $6,
+                record_version = record_version + 1,
+                updated_at = $4,
+                updated_by_user_id = $5
+          WHERE id = $1 AND store_id = $2`,
+        [product.id, principal.storeId, stockAfter, now, principal.userId, stockAfterBase],
       );
     }
 
@@ -857,9 +883,6 @@ export class PosService {
       baseQuantity = this.convertInputToBase(unit, inputQuantity);
       subtotal = Math.round(inputQuantity * unit.selling_price);
     }
-    if (baseQuantity > this.currentBaseStock(product)) {
-      throw new StaleConflict('stale_product', `Only ${this.currentBaseStock(product)} base units of ${product.name} remain.`);
-    }
     return {
       product,
       unit,
@@ -881,7 +904,8 @@ export class PosService {
         throw new ConflictException(`Only ${product.stock_quantity} ${product.unit} of ${product.name} remain`);
       }
       const quantity = this.normalizeQuantity(enteredAmount / product.selling_price);
-      return { product, quantity, inputQuantity: quantity, baseQuantity: undefined, unit: undefined, subtotal: enteredAmount };
+      const baseQuantity = Math.round(quantity * this.legacyDisplayMultiplier(product));
+      return { product, quantity, inputQuantity: quantity, baseQuantity, unit: undefined, subtotal: enteredAmount };
     }
     const quantity = line.quantity;
     if (!Number.isFinite(quantity) || quantity <= 0) throw new ConflictException(`Enter a valid quantity for ${product.name}`);
@@ -889,10 +913,8 @@ export class PosService {
     if (!this.isStepAligned(quantity, step)) {
       throw new ConflictException(`${product.name} must be sold in increments of ${step} ${product.unit}`);
     }
-    if (product.stock_quantity < quantity) {
-      throw new StaleConflict('stale_product', `Only ${product.stock_quantity} ${product.unit} of ${product.name} remain.`);
-    }
-    return { product, quantity, inputQuantity: quantity, baseQuantity: undefined, unit: undefined, subtotal: Math.round(quantity * product.selling_price) };
+    const baseQuantity = Math.round(quantity * this.legacyDisplayMultiplier(product));
+    return { product, quantity, inputQuantity: quantity, baseQuantity, unit: undefined, subtotal: Math.round(quantity * product.selling_price) };
   }
 
   private baseIncrement(unit: ProductUnitRow) {
@@ -1082,12 +1104,15 @@ export class PosService {
     if (!roles.includes(principal.role)) throw new ForbiddenException('You do not have access to this action');
   }
 
-  private async conflict(storeId: string, reason: CommandConflictReason, message: string): Promise<StoreCommandResponse> {
-    const [snapshot, cursor] = await Promise.all([
-      this.data.loadSnapshot(storeId),
-      this.data.currentCursor(storeId),
-    ]);
-    return { status: 'conflict', reason, cursor, message, snapshot };
+  private async conflict(
+    storeId: string,
+    reason: CommandConflictReason,
+    message: string,
+    includeSnapshot = true,
+  ): Promise<StoreCommandResponse> {
+    const cursor = await this.data.currentCursor(storeId);
+    const snapshot = includeSnapshot ? await this.data.loadBrowserSnapshot(storeId) : undefined;
+    return { status: 'conflict', reason, cursor, message, ...(snapshot ? { snapshot } : {}) };
   }
 }
 

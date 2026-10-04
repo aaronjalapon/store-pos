@@ -42,6 +42,7 @@ export async function runMigrations(databaseUrl: string, options: RunMigrationsO
       .filter((file) => file.endsWith('.sql'))
       .sort();
 
+    const appliedFilenames: string[] = [];
     for (const filename of migrations) {
       const sql = await readFile(resolve(migrationsDir, filename), 'utf8');
       const checksum = createHash('sha256').update(sql).digest('hex');
@@ -61,13 +62,19 @@ export async function runMigrations(databaseUrl: string, options: RunMigrationsO
           [filename, checksum],
         );
         await client.query('COMMIT');
+        appliedFilenames.push(filename);
       } catch (error) {
         await client.query('ROLLBACK');
         throw error;
       }
     }
 
-    return { appliedCount: migrations.length, completed: true as const };
+    return {
+      appliedCount: appliedFilenames.length,
+      skippedCount: migrations.length - appliedFilenames.length,
+      appliedFilenames,
+      completed: true as const,
+    };
   } finally {
     await client.query('SELECT pg_advisory_unlock($1)', [4_202_608_12]).catch(() => undefined);
     await client.end();

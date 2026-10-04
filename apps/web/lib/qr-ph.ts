@@ -12,7 +12,7 @@ export async function getCachedQrPhImage() {
   if (!session?.store) return null;
   const settings = await db.paymentSettings.get(session.store.id);
   const image = await db.qrPhImages.get('qrph');
-  return settings && image?.revision === settings.imageRevision ? { settings, image } : null;
+  return settings && image?.storeId === session.store.id && image.revision === settings.imageRevision ? { settings, image } : null;
 }
 
 export async function hydrateQrPhImage(apiUrl = API_DEFAULT) {
@@ -24,7 +24,7 @@ export async function hydrateQrPhImage(apiUrl = API_DEFAULT) {
     return null;
   }
   const cached = await db.qrPhImages.get('qrph');
-  if (cached?.revision === settings.imageRevision) return cached;
+  if (cached?.storeId === session.store.id && cached.revision === settings.imageRevision) return cached;
   const response = await fetch(qrUrl(apiUrl, session.store.id, settings.imageRevision), {
     headers: { authorization: `Bearer ${token}` },
   });
@@ -33,6 +33,7 @@ export async function hydrateQrPhImage(apiUrl = API_DEFAULT) {
   if (!ALLOWED_TYPES.has(blob.type as QrPhPaymentSettings['contentType']) || blob.size > MAX_BYTES) return null;
   const record: QrPhImageRecord = {
     key: 'qrph',
+    storeId: session.store.id,
     revision: settings.imageRevision,
     blob,
     contentType: blob.type as QrPhPaymentSettings['contentType'],
@@ -60,7 +61,7 @@ export async function uploadQrPhImage(file: File, apiUrl = API_DEFAULT) {
   await db.transaction('rw', [db.paymentSettings, db.qrPhImages], async () => {
     await db.paymentSettings.put(settings);
     await db.qrPhImages.put({
-      key: 'qrph', revision, blob: file, contentType: settings.contentType,
+      key: 'qrph', storeId: session.store!.id, revision, blob: file, contentType: settings.contentType,
       byteLength: file.size, updatedAt: settings.updatedAt,
     });
   });

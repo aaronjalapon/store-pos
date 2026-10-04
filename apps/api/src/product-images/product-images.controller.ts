@@ -14,14 +14,17 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { SessionAuthGuard } from '../auth/session-auth.guard';
+import { Roles } from '../auth/roles.decorator';
+import { RolesGuard } from '../auth/roles.guard';
 import { ProductImagesService } from './product-images.service';
 
 @Controller('stores/:storeId/products/:productId/images')
-@UseGuards(SessionAuthGuard)
+@UseGuards(SessionAuthGuard, RolesGuard)
 export class ProductImagesController {
   constructor(private readonly images: ProductImagesService) {}
 
   @Put(':revision')
+  @Roles('owner', 'admin')
   put(
     @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
@@ -50,6 +53,7 @@ export class ProductImagesController {
   }
 
   @Delete(':revision')
+  @Roles('owner', 'admin')
   delete(
     @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,

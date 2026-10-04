@@ -8,7 +8,8 @@
     "start": "node dist/main.js",
     "test": "jest --runInBand",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:migrate": "tsx src/database/migrate.ts"
+    "db:migrate": "tsx src/database/migrate.ts",
+    "backup:restore": "npm run build && node dist/backups/restore-backup.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.879.0",
@@ -18,14 +19,20 @@
     "@nestjs/core": "^11.2.7",
     "@nestjs/jwt": "^11.0.2",
     "@nestjs/platform-express": "^11.2.7",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.4.1",
     "express": "^5.2.1",
+    "helmet": "^8.3.0",
     "pg": "^8.16.3",
+    "pino-http": "^11.0.0",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2"
+    "rxjs": "^7.8.2",
+    "sharp": "^0.35.5"
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.10",
     "@nestjs/testing": "^11.2.7",
+    "@types/cookie-parser": "^1.4.10",
     "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
     "@types/node": "^24.3.0",

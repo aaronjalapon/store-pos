@@ -72,7 +72,7 @@ describe('PosService activity attribution', () => {
     };
     const data = {
       createSyncEvent: jest.fn(), currentCursor: jest.fn().mockResolvedValue(1),
-      loadSnapshot: jest.fn().mockResolvedValue({ products: [], productUnits: [], sales: [], saleItems: [], inventoryMovements: [], customers: [], utangEntries: [], expenses: [], staff: [] }),
+      loadBrowserSnapshot: jest.fn().mockResolvedValue({ products: [], productUnits: [], sales: [], saleItems: [], inventoryMovements: [], customers: [], utangEntries: [], expenses: [], staff: [] }),
     };
     const activity = { record: jest.fn() };
     const auth = { verify: jest.fn().mockResolvedValue(actor) };

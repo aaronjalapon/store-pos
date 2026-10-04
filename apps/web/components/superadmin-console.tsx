@@ -1,12 +1,14 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import type { StaffMember, SuperadminAuthSession, SuperadminStoreDetailsResponse, SuperadminStoreSummary } from '@gma/contracts';
+import type { DeviceEnrollmentChallenge, StaffMember, SuperadminAuthSession, SuperadminStoreDetailsResponse, SuperadminStoreSummary } from '@gma/contracts';
 import { Activity, CheckCircle2, Cloud, KeyRound, LogOut, Plus, ShieldCheck, Store, UserRoundPlus, Users, XCircle } from 'lucide-react';
 import {
   createSuperadminStore,
   createSuperadminStoreStaff,
   getSuperadminStoreDetails,
+  decideDeviceEnrollment,
+  listDeviceEnrollments,
   listSuperadminStores,
   resetSuperadminStaffSecret,
   updateSuperadminStaffStatus,
@@ -27,6 +29,7 @@ export function SuperadminConsole({ session, onLogout }: {
   const [pendingMember, setPendingMember] = useState<{ member: StaffMember; isActive: boolean } | null>(null);
   const [resetMember, setResetMember] = useState<StaffMember | null>(null);
   const [resetPassword, setResetPassword] = useState('');
+  const [enrollments, setEnrollments] = useState<DeviceEnrollmentChallenge[]>([]);
 
   const selectedStore = stores.find((store) => store.id === selectedStoreId) ?? stores[0] ?? null;
 
@@ -46,6 +49,9 @@ export function SuperadminConsole({ session, onLogout }: {
 
   useEffect(() => {
     void refresh().catch((error) => setMessage(error instanceof Error ? error.message : 'Could not load stores'));
+    if (typeof navigator === 'undefined' || navigator.onLine) {
+      void listDeviceEnrollments().then(setEnrollments).catch(() => undefined);
+    }
   }, [refresh]);
 
   useEffect(() => {
@@ -193,6 +199,13 @@ export function SuperadminConsole({ session, onLogout }: {
                 <button type="button" className="secondary-button compact" disabled={busy} onClick={() => setSelectedStoreId(store.id)}>Inspect</button>
               </div>
             )) : <p className="muted">No stores yet.</p>}
+          </div>
+        </section>
+
+        <section className="report-card">
+          <div className="section-heading"><div><p className="eyebrow">DEVICE TRUST</p><h2>Pending enrollment</h2></div><ShieldCheck /></div>
+          <div className="recent-expenses">
+            {enrollments.length ? enrollments.map((challenge) => <div key={challenge.id} className="staff-row"><span><strong>{challenge.deviceName}</strong><small>{challenge.displayName} · {challenge.storeName} · expires {new Date(challenge.expiresAt).toLocaleString('en-PH')}</small></span><div className="staff-actions"><button type="button" className="primary-button compact" disabled={busy} onClick={() => void run(async () => { await decideDeviceEnrollment(challenge.id, true); setEnrollments((current) => current.filter((item) => item.id !== challenge.id)); }, `${challenge.deviceName} approved.`)}>Approve</button><button type="button" className="danger-button" disabled={busy} onClick={() => void run(async () => { await decideDeviceEnrollment(challenge.id, false); setEnrollments((current) => current.filter((item) => item.id !== challenge.id)); }, `${challenge.deviceName} denied.`)}>Deny</button></div></div>) : <p className="muted">No devices are waiting for approval.</p>}
           </div>
         </section>
 

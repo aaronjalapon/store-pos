@@ -51,12 +51,12 @@ describe('product image sync queue', () => {
     const productId = '71551dba-4438-47b8-995c-8fe6153e307c';
     const revision = '94e72a36-4f59-4e69-8d87-3067a5e42fae';
     await db.productImages.put({
-      productId, revision, blob: new Blob(['image'], { type: 'image/webp' }), contentType: 'image/webp',
+      productId, storeId: 'store', revision, blob: new Blob(['image'], { type: 'image/webp' }), contentType: 'image/webp',
       byteLength: 5, syncStatus: 'pending', updatedAt: new Date().toISOString(),
     });
     await db.productImageQueue.bulkPut([
-      { id: `upload:${productId}:${revision}`, productId, revision, operation: 'upload', attemptCount: 0, lastAttemptAt: null },
-      { id: `delete:${productId}:old`, productId, revision: 'old', operation: 'delete', attemptCount: 0, lastAttemptAt: null },
+      { id: `upload:${productId}:${revision}`, storeId: 'store', productId, revision, operation: 'upload', attemptCount: 0, lastAttemptAt: null },
+      { id: `delete:${productId}:old`, storeId: 'store', productId, revision: 'old', operation: 'delete', attemptCount: 0, lastAttemptAt: null },
     ]);
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);

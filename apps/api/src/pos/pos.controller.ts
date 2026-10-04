@@ -8,6 +8,7 @@ import {
   Req,
   UseGuards,
   Body,
+  Headers,
 } from '@nestjs/common';
 import { storeCommandRequestSchema, type StoreCommandRequest } from '@gma/contracts';
 import type { Request } from 'express';
@@ -24,6 +25,7 @@ export class PosController {
     @Req() request: Request,
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Body() body: StoreCommandRequest,
+    @Headers('x-pos-sync-version') syncVersion?: string,
   ) {
     this.assertStoreScope(request, storeId);
     const result = storeCommandRequestSchema.safeParse(body);
@@ -37,7 +39,7 @@ export class PosController {
         })),
       });
     }
-    return this.pos.applyCommand(request.principal!, result.data);
+    return this.pos.applyCommand(request.principal!, result.data, syncVersion !== '2');
   }
 
   private assertStoreScope(request: Request, storeId: string) {
