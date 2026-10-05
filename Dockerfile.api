@@ -20,6 +20,7 @@ COPY --from=build --chown=pos:pos /app/packages/domain ./packages/domain
 COPY --from=build --chown=pos:pos /app/apps/api/dist ./apps/api/dist
 COPY --from=build --chown=pos:pos /app/apps/api/migrations ./apps/api/migrations
 COPY --from=build --chown=pos:pos /app/apps/api/package.json ./apps/api/package.json
+COPY --chown=pos:pos deploy/certs/supabase-prod-ca-2021.crt ./certs/supabase-prod-ca-2021.crt
 USER pos
 EXPOSE 4000
 WORKDIR /app/apps/api

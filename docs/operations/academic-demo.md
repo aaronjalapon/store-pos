@@ -31,6 +31,7 @@ Provide the prompted variables:
 | Variable | Value |
 | --- | --- |
 | `DATABASE_URL` | Supabase session-pooler URL with verified TLS |
+| `NODE_EXTRA_CA_CERTS` | `/app/certs/supabase-prod-ca-2021.crt` (set by the Blueprint) |
 | `CORS_ORIGIN` | Exact final website origin, e.g. `https://YOUR-PROJECT.vercel.app`; no slash or path |
 | `SUPERADMIN_EMAIL` | Your private administrator login |
 | `SUPERADMIN_PASSWORD` | Unique random password, at least 16 characters; no placeholder text |
@@ -45,6 +46,8 @@ The API runs migrations automatically at startup, then ensures the configured su
 `TRUST_PROXY_HOPS=1` trusts Render's immediate ingress. Verify rate limiting and client IP attribution through both the Vercel URL and the direct API URL; do not blindly increase this value because the public API has a shorter proxy path. A shared proxy IP can aggregate the small demo's login limits; avoid repeated failed logins.
 
 ## 3. Deploy the website
+
+The Docker image includes the public Supabase Root 2021 CA downloaded from the project's Database Settings certificate link. `NODE_EXTRA_CA_CERTS` adds it to Node's trust store while `sslmode=verify-full` still validates the certificate and hostname. Its SHA-256 fingerprint is `80:70:25:AD:50:D4:ED:21:9D:2C:9C:7D:29:9C:00:4F:82:4E:B0:0C:F7:F6:5A:FE:F6:07:D0:7B:72:E6:CA:FA`; it expires April 26, 2031. Follow Supabase's certificate rotation guidance if that CA changes.
 
 Import the repository into a Vercel **Hobby** project. Choose root directory `apps/web`, enable **Include source files outside of the Root Directory**, and select Node 22.x. The checked-in configuration installs from the workspace root and builds the shared packages before Next.js.
 
@@ -124,8 +127,12 @@ Fill these in after the hosted checks pass; configuration files alone do not con
 
 - Website URL: pending
 - Render API URL: pending
-- Supabase project reference: pending
+- Supabase project reference: `xoqpymjnsrgusrndhlqt` (`store-pos-academic-demo`, Singapore, Free)
 - Deployed commit: pending
 - Hosted acceptance date/result: pending
 - Private credential location: `.demo/demo-access.txt`
 - Pre-demo database export: `.demo/pre-demo.dump`
+
+Provisioning checkpoint (October 5, 2026): the dedicated Supabase project and private `gma-pos-demo` bucket exist. The Data API is disabled. Live S3 bucket access, upload, download, copy, and deletion passed; disposable verification objects were removed. The session pooler host is `aws-0-ap-southeast-1.pooler.supabase.com`, port `5432`, database `postgres`, user `postgres.xoqpymjnsrgusrndhlqt`. Render and Vercel deployment and hosted application checks remain pending. The tested hosting implementation is on branch `codex/academic-demo-hosting` (commit `78711cb`).
+
+Private provisioning files under `.demo/` contain the storage credentials and generated application secrets. They are excluded from Git and Docker; keep them private and preserve the backup encryption key. `.demo/database-password.txt` is the local handoff file for the database password chosen during project creation. Never copy these files into a public deployment record.
