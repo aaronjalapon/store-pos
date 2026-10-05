@@ -93,8 +93,8 @@ export function isInvalidSessionError(error: unknown) {
   return error instanceof ApiRequestError && (error.status === 401 || error.status === 403);
 }
 
-export async function fetchSetupStatus(apiUrl = API_DEFAULT) {
-  return apiRequest<SetupStatusResponse>(normalizeApiUrl(apiUrl), '/v1/auth/setup-status');
+export async function fetchSetupStatus(apiUrl = API_DEFAULT, signal?: AbortSignal) {
+  return apiRequest<SetupStatusResponse>(normalizeApiUrl(apiUrl), '/v1/auth/setup-status', { signal, cache: 'no-store' });
 }
 
 export async function setupOwner(input: Omit<SetupOwnerRequest, 'deviceId'> & { apiUrl?: string }) {

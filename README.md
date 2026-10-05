@@ -16,6 +16,10 @@ CCE106L Applications Development and Emerging Technologies
 
 The PWA opens at `http://localhost:3000` and the API at `http://localhost:4000`.
 
+## Free academic deployment
+
+See [the academic demo guide](docs/operations/academic-demo.md) for Vercel Hobby, Render Free, and Supabase Free setup, same-origin login routing, fictional sample data, and the presentation checklist. Hosting configuration lives in `render.yaml` and `apps/web/vercel.json`. Sample data is created only by explicitly running `npm run demo:setup` with the documented environment settings.
+
 The API creates or updates the configured superadmin account on startup when `SUPERADMIN_EMAIL` and `SUPERADMIN_PASSWORD` are set. Sign in through the Owner / Admin / Superadmin tab to create stores and assign owner/admin access.
 
 ## Offline model

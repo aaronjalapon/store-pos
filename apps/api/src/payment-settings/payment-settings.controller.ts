@@ -30,7 +30,7 @@ export class PaymentSettingsController {
     this.assertStoreScope(request, storeId);
     const object = await this.settings.getQr(request.principal!, revision);
     response.setHeader('content-type', object.contentType);
-    response.setHeader('cache-control', 'private, max-age=31536000, immutable');
+    response.setHeader('cache-control', 'private, no-store');
     return Buffer.from(object.body);
   }
 

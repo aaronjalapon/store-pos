@@ -19,6 +19,8 @@ blob-report/
 !.env.*.example
 *.log
 apps/api/.storage/
+.vercel/
+.demo/
 
 # Generated deliverables, screenshots, and exports
 /output/

@@ -48,7 +48,7 @@ export class ProductImagesController {
     this.assertStoreScope(request, storeId);
     const object = await this.images.get(request.principal!, productId, revision);
     reply.setHeader('content-type', object.contentType);
-    reply.setHeader('cache-control', 'private, max-age=31536000, immutable');
+    reply.setHeader('cache-control', 'private, no-store');
     return Buffer.from(object.body);
   }
 

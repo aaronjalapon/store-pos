@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { json, raw, urlencoded } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { pinoHttp } from 'pino-http';
@@ -37,6 +38,12 @@ async function bootstrap() {
   app.disable('x-powered-by');
   app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 0));
   app.use(helmet());
+  app.use('/v1', (_request: Request, response: Response, next: NextFunction) => {
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.setHeader('CDN-Cache-Control', 'no-store');
+    response.setHeader('Vercel-CDN-Cache-Control', 'no-store');
+    next();
+  });
   app.use(pinoHttp({
     genReqId: (request, response) => {
       const existing = request.headers['x-request-id'];

@@ -7,8 +7,9 @@ import { ApiRequestError, fetchSetupStatus, isInvalidSessionError, loginCashier,
 import { getActiveStoreId, getSession, hasCompletedBootstrap, signOutLocally } from '../lib/db';
 import { PosApp } from './pos-app';
 import { SuperadminConsole } from './superadmin-console';
+import { waitForInitialConnection } from '../lib/initial-connection';
 
-type Mode = 'loading' | 'setup' | 'owner' | 'cashier';
+type Mode = 'loading' | 'connection-error' | 'setup' | 'owner' | 'cashier';
 
 export function AuthShell() {
   const [mode, setMode] = useState<Mode>('loading');
@@ -18,9 +19,11 @@ export function AuthShell() {
   const [offlineReady, setOfflineReady] = useState(false);
   const [knownStoreId, setKnownStoreId] = useState('');
   const [online, setOnline] = useState(true);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     setOnline(navigator.onLine);
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
@@ -95,21 +98,22 @@ export function AuthShell() {
         return;
       }
       try {
-        const status = await fetchSetupStatus();
+        const status = await waitForInitialConnection((signal) => fetchSetupStatus(undefined, signal), controller.signal);
         if (!active) return;
         setMode(status.needsSetup ? 'setup' : 'owner');
       } catch (error) {
         if (!active) return;
-        setMode('owner');
+        setMode('connection-error');
         setMessage(error instanceof Error ? error.message : 'Could not reach the server');
       }
     })();
     return () => {
       active = false;
+      controller.abort();
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, []);
+  }, [connectionAttempt]);
 
   async function perform(work: () => Promise<AuthSession>) {
     setBusy(true);
@@ -160,11 +164,18 @@ export function AuthShell() {
           </div>
         </div>
 
-        <div className="auth-tabs">
+        {mode === 'loading' && <p className="form-message auth-message" role="status">Connecting to the demo server… This may take up to two minutes on the first visit.</p>}
+        {mode === 'connection-error' && <button className="primary-button" onClick={() => {
+          setMessage('');
+          setMode('loading');
+          setConnectionAttempt((attempt) => attempt + 1);
+        }}>Retry connection</button>}
+
+        {mode !== 'loading' && mode !== 'connection-error' && <div className="auth-tabs">
           {mode === 'setup' && <button className="active"><Store size={16} /> First store setup</button>}
           {mode !== 'setup' && <button className={mode === 'owner' ? 'active' : ''} aria-pressed={mode === 'owner'} onClick={() => setMode('owner')}><ShieldCheck size={16} /> Manager</button>}
           {knownStoreId && <button className={mode === 'cashier' ? 'active' : ''} aria-pressed={mode === 'cashier'} onClick={() => setMode('cashier')}><Users size={16} /> Cashier</button>}
-        </div>
+        </div>}
 
         {mode === 'setup' && <form className="stack-form auth-form" onSubmit={(event) => {
           event.preventDefault();

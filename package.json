@@ -16,6 +16,8 @@
     "test": "npm run build:packages && npm run test -w @gma/domain && npm run test -w @gma/api && npm run test -w @gma/web",
     "typecheck": "npm run build:packages && npm run typecheck -w @gma/api && npm run typecheck -w @gma/web",
     "db:migrate": "npm run db:migrate -w @gma/api",
+    "demo:setup": "node scripts/demo-setup.mjs",
+    "test:demo": "node scripts/demo-acceptance.mjs",
     "test:real-stack": "node scripts/real-stack-acceptance.mjs",
     "test:final-qa": "node scripts/final-qa-acceptance.mjs && node scripts/final-qa-auth.mjs && node scripts/final-qa-migrations.mjs"
   },

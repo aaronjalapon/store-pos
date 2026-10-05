@@ -1,4 +1,6 @@
 .git
+.demo
+.vercel
 .next
 **/.next
 node_modules

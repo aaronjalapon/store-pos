@@ -1,0 +1,50 @@
+# Create a Free workspace and use this Blueprint. Do not attach a payment method.
+services:
+  - type: web
+    name: store-pos-demo-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile.api
+    dockerContext: .
+    healthCheckPath: /health/live
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: METRICS_TOKEN
+        generateValue: true
+      - key: SUPERADMIN_EMAIL
+        sync: false
+      - key: SUPERADMIN_PASSWORD
+        sync: false
+      - key: SUPERADMIN_DISPLAY_NAME
+        value: Demo Administrator
+      - key: BACKUP_MAX_BYTES
+        value: 41943040
+      - key: BACKUP_ENCRYPTION_ACTIVE_KEY_ID
+        value: demo-v1
+      - key: BACKUP_ENCRYPTION_KEYS_JSON
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_BUCKET
+        value: gma-pos-demo
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: S3_FORCE_PATH_STYLE
+        value: "true"
+      # Trust only Render's ingress. Verify client-IP behavior through Vercel.
+      - key: TRUST_PROXY_HOPS
+        value: "1"
