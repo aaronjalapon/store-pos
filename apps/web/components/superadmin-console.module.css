@@ -1,0 +1,204 @@
+.shell {
+  padding-bottom: 0;
+}
+
+.shell .content {
+  width: 100%;
+  max-width: 1360px;
+  margin-inline: auto;
+  padding: 40px clamp(20px, 4vw, 48px) 64px;
+  display: grid;
+  gap: 28px;
+}
+
+.shell .forms {
+  margin-top: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px;
+  align-items: start;
+}
+
+.shell :global(.page-header) {
+  margin-bottom: 0;
+}
+
+.shell :global(.page-header p) {
+  max-width: 640px;
+  line-height: 1.65;
+}
+
+.shell :global(.settings-card),
+.shell :global(.report-card) {
+  min-width: 0;
+  padding: 28px;
+  border-radius: 22px;
+}
+
+.shell :global(.section-heading) {
+  gap: 20px;
+  margin-bottom: 24px;
+}
+
+.shell :global(.section-heading h2) {
+  margin: 8px 0 0;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.shell :global(.section-heading p:not(.eyebrow)) {
+  margin: 10px 0 0;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.shell :global(.section-heading > svg) {
+  flex-shrink: 0;
+}
+
+.shell :global(.stack-form) {
+  gap: 20px;
+}
+
+.shell :global(.stack-form label) {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.shell :global(.stack-form input),
+.shell :global(.stack-form select) {
+  min-width: 0;
+  height: 52px;
+  padding-inline: 14px;
+  font-size: 16px;
+  border-radius: 12px;
+}
+
+.shell :global(.primary-button),
+.shell :global(.secondary-button),
+.shell :global(.danger-button) {
+  min-height: 48px;
+  padding: 12px 20px;
+  gap: 9px;
+  font-size: 14px;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
+
+.shell :global(.stack-form > button) {
+  min-height: 52px;
+  margin-top: 4px;
+}
+
+.shell :global(.recent-expenses) {
+  margin-top: 0;
+}
+
+.shell :global(.recent-expenses > strong) {
+  margin-bottom: 16px;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.shell :global(.recent-expenses > div) {
+  padding-block: 20px;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.shell :global(.recent-expenses > div > span) {
+  flex: 1 1 240px;
+  min-width: 0;
+  gap: 6px;
+  font-size: 15px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.shell :global(.recent-expenses small) {
+  margin-top: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.shell :global(.staff-actions) {
+  gap: 12px;
+}
+
+.shell :global(.metric-grid) {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.shell :global(.metric-card) {
+  min-width: 0;
+  min-height: 168px;
+  padding: 24px;
+  gap: 16px;
+}
+
+.shell :global(.metric-card > strong) {
+  font-size: clamp(24px, 2.5vw, 32px);
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.shell :global(.metric-card small) {
+  line-height: 1.6;
+}
+
+.shell :global(.button-row) {
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+@media (max-width: 960px) {
+  .shell .forms {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .shell .content {
+    padding: 28px 16px 40px;
+    gap: 24px;
+  }
+
+  .shell :global(.settings-card),
+  .shell :global(.report-card) {
+    padding: 20px;
+    border-radius: 18px;
+  }
+
+  .shell :global(.section-heading) {
+    gap: 12px;
+  }
+
+  .shell :global(.recent-expenses > div) {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .shell :global(.recent-expenses > div > span) {
+    flex-basis: auto;
+  }
+
+  .shell :global(.staff-actions) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    width: 100%;
+  }
+
+  .shell :global(.metric-grid) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .shell :global(.metric-card) {
+    min-height: 144px;
+    padding: 20px;
+  }
+}

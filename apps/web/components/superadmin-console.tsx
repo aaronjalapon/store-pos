@@ -15,6 +15,7 @@ import {
   updateSuperadminStoreStatus,
 } from '../lib/api';
 import { ConfirmModal } from './app-modal';
+import styles from './superadmin-console.module.css';
 
 export function SuperadminConsole({ session, onLogout }: {
   session: SuperadminAuthSession;
@@ -124,7 +125,7 @@ export function SuperadminConsole({ session, onLogout }: {
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${styles.shell}`}>
       <header className="topbar">
         <div className="store-wordmark"><div className="brand-mark small">G</div><div><strong>Superadmin</strong><span>STORE CONTROL</span></div></div>
         <div className="topbar-actions">
@@ -132,12 +133,12 @@ export function SuperadminConsole({ session, onLogout }: {
           <button className="secondary-button compact" onClick={() => void onLogout()}><LogOut size={16} /> Logout</button>
         </div>
       </header>
-      <section className="page-panel">
+      <section className={`page-panel ${styles.content}`}>
         <div className="page-header">
           <div><p className="eyebrow">GLOBAL OVERSIGHT</p><h1>Stores</h1><p>Monitor store access and health, then manage owner and admin lifecycle controls.</p></div>
         </div>
         {message && <p className="form-message">{message}</p>}
-        <div className="more-grid">
+        <div className={`more-grid ${styles.forms}`}>
           <section className="settings-card">
             <div className="section-heading"><div><p className="eyebrow">NEW STORE</p><h2>Create store</h2></div><Store /></div>
             <form className="stack-form" onSubmit={(event) => {
