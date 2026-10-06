@@ -158,3 +158,11 @@ For independent grading, arrange browser enrollment before handing out access. T
 The private database handoff uses the session pooler `aws-0-ap-southeast-1.pooler.supabase.com`, port `5432`, database `postgres`, user `postgres.xoqpymjnsrgusrndhlqt`. The final Render deployment (`dep-db2bi5ui0phs73e37arg`) was confirmed Live; hosted acceptance checks passed again after that redeployment.
 
 Private provisioning files under `.demo/` contain the storage credentials and generated application secrets. They are excluded from Git and Docker; keep them private and preserve the backup encryption key. `.demo/database-password.txt` is the local handoff file for the database password chosen during project creation. Never copy these files into a public deployment record.
+
+### Demo credential update (October 6, 2026)
+
+At the owner's request, the live administrator and store-owner emails now use `example.com`, with memorable eight-character passwords. The cashier uses a memorable six-digit PIN. Exact credentials remain in the private account files above. Existing sessions were revoked, and all three account logins passed through the public website. Product and transaction data were preserved.
+
+The live Render service no longer has `SUPERADMIN_EMAIL` or `SUPERADMIN_PASSWORD`: the administrator already exists in Supabase, and removing the one-time bootstrap pair prevents startup from overwriting the updated credentials or recreating the old administrator. The generic production configuration still requires at least 16 characters when bootstrap credentials are supplied for a new deployment. Do not reintroduce the old bootstrap pair on this demo.
+
+A fresh verified-TLS public-schema export after the credential update is `.demo/pre-demo-credentials-updated.dump`, with its listing in `.demo/pre-demo-credentials-updated.contents.txt`. Earlier exports contain the earlier account credentials. Continue to keep administrator access private.
