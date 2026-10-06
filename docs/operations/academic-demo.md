@@ -127,7 +127,7 @@ Deployment completed October 6, 2026. All three services use free plans; Render'
 
 | Resource | Deployed value |
 | --- | --- |
-| Public website | https://store-pos-academic-demo.vercel.app |
+| Public website | https://gma-store-pos.vercel.app |
 | Render API | https://store-pos-demo-api.onrender.com |
 | Render service | `store-pos-demo-api` / `srv-db1o973tqb8s73e1blt0`, Singapore, Free |
 | Vercel project | `store-pos-academic-demo`, Hobby |
@@ -166,3 +166,7 @@ At the owner's request, the live administrator and store-owner emails now use `e
 The live Render service no longer has `SUPERADMIN_EMAIL` or `SUPERADMIN_PASSWORD`: the administrator already exists in Supabase, and removing the one-time bootstrap pair prevents startup from overwriting the updated credentials or recreating the old administrator. The generic production configuration still requires at least 16 characters when bootstrap credentials are supplied for a new deployment. Do not reintroduce the old bootstrap pair on this demo.
 
 A fresh verified-TLS public-schema export after the credential update is `.demo/pre-demo-credentials-updated.dump`, with its listing in `.demo/pre-demo-credentials-updated.contents.txt`. Earlier exports contain the earlier account credentials. Continue to keep administrator access private.
+
+### Public domain update (October 6, 2026)
+
+The owner changed the public address to `https://gma-store-pos.vercel.app`. Use this address for instructor access and presentation links. Keep Vercel's Production `NEXT_PUBLIC_API_URL` and Render's `CORS_ORIGIN` aligned with that exact origin. The API proxy target remains `https://store-pos-demo-api.onrender.com`. A browser using the new origin has a separate local cache and may need enrollment before owner/cashier access; pending offline sales on the old origin remain there until they sync.
