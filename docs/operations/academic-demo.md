@@ -45,9 +45,9 @@ The API runs migrations automatically at startup, then ensures the configured su
 
 `TRUST_PROXY_HOPS=1` trusts Render's immediate ingress. Verify rate limiting and client IP attribution through both the Vercel URL and the direct API URL; do not blindly increase this value because the public API has a shorter proxy path. A shared proxy IP can aggregate the small demo's login limits; avoid repeated failed logins.
 
-## 3. Deploy the website
-
 The Docker image includes the public Supabase Root 2021 CA downloaded from the project's Database Settings certificate link. `NODE_EXTRA_CA_CERTS` adds it to Node's trust store while `sslmode=verify-full` still validates the certificate and hostname. Its SHA-256 fingerprint is `80:70:25:AD:50:D4:ED:21:9D:2C:9C:7D:29:9C:00:4F:82:4E:B0:0C:F7:F6:5A:FE:F6:07:D0:7B:72:E6:CA:FA`; it expires April 26, 2031. Follow Supabase's certificate rotation guidance if that CA changes.
+
+## 3. Deploy the website
 
 Import the repository into a Vercel **Hobby** project. Choose root directory `apps/web`, enable **Include source files outside of the Root Directory**, and select Node 22.x. The checked-in configuration installs from the workspace root and builds the shared packages before Next.js.
 
@@ -123,16 +123,38 @@ Build the MinIO image first with `docker compose -p store-pos-demo-test -f docke
 
 ### Hosted rollout status
 
-Fill these in after the hosted checks pass; configuration files alone do not constitute a deployment.
+Deployment completed October 6, 2026. All three services use free plans; Render's billing page shows Hobby, no card on file, and $0 unbilled charges.
 
-- Website URL: pending
-- Render API URL: pending
-- Supabase project reference: `xoqpymjnsrgusrndhlqt` (`store-pos-academic-demo`, Singapore, Free)
-- Deployed commit: pending
-- Hosted acceptance date/result: pending
-- Private credential location: `.demo/demo-access.txt`
-- Pre-demo database export: `.demo/pre-demo.dump`
+| Resource | Deployed value |
+| --- | --- |
+| Public website | https://store-pos-academic-demo.vercel.app |
+| Render API | https://store-pos-demo-api.onrender.com |
+| Render service | `store-pos-demo-api` / `srv-db1o973tqb8s73e1blt0`, Singapore, Free |
+| Vercel project | `store-pos-academic-demo`, Hobby |
+| Supabase project | `xoqpymjnsrgusrndhlqt` / `store-pos-academic-demo`, Singapore, Free |
+| Production branch | `codex/academic-demo-hosting` |
+| Application commit on both hosts | `95dcdb2458ee1107c83f4900cb4097ad16ff4986` |
+| Private owner/cashier accounts | `.demo/demo-access.txt` |
+| Private administrator account | `.demo/admin-access.txt`; never give this to graders |
+| Database export | `.demo/pre-demo.dump` |
+| Encrypted store backup | `.demo/pre-demo.backup.json`; retain the backup key and storage objects separately |
 
-Provisioning checkpoint (October 5, 2026): the dedicated Supabase project and private `gma-pos-demo` bucket exist. The Data API is disabled. Live S3 bucket access, upload, download, copy, and deletion passed; disposable verification objects were removed. The session pooler host is `aws-0-ap-southeast-1.pooler.supabase.com`, port `5432`, database `postgres`, user `postgres.xoqpymjnsrgusrndhlqt`. Render and Vercel deployment and hosted application checks remain pending. The tested hosting implementation is on branch `codex/academic-demo-hosting` (commit `78711cb`).
+Vercel tracks the production branch above. Render was imported using the public repository URL without a connected GitHub integration: after future application changes, use **Manual Deploy → Deploy latest commit** and verify `/health/ready`. A Git push alone is not proof of a Render deployment. Keep deployment settings on the production branch until deliberately migrating them to another branch.
+
+Verified on October 6:
+
+- All 163 existing and added tests passed, along with both applications' type checks and production builds. The API Docker image built with verified Supabase TLS.
+- Public owner/cashier login, refresh-cookie rotation, logout revocation, device enrollment, and uncached JSON/binary proxy requests passed. Refresh cookies use Secure, HttpOnly, SameSite=Lax and the existing `/v1/auth` path.
+- Supabase Data API is disabled; the bucket is private. Live S3 upload, download, copy, and deletion passed. Product and fictional QR images survived the API restart and subsequent redeployment.
+- The fictional store contains 20 products, one customer, one cashier, and four sales: the three seeded cash/utang/QR transactions plus one offline cash verification sale.
+- An enrolled browser recorded a ₱7 vinegar sale offline, retained the pending sale after an offline reload, and synced after an API restart. The database contains exactly one sale from that device; stock changed from 50 to 49.
+- The final encrypted backup decrypted successfully with 20 products, four sales, and both product/QR attachments. The separate PostgreSQL 17 public-schema export restored into a disposable database with one store, 20 products, and four sales.
+- Usage at the backup checkpoint: database 12,883,635 bytes (about 12.3 MiB); bucket objects 17,832 bytes; encrypted backup 11,730 bytes. The export is 128,311 bytes. Recheck usage and refresh these backups after further demo activity.
+
+Remaining presentation checks: use a physical phone browser to test login/enrollment, refresh, and cashier access; leave Render idle for 15 minutes and test a fresh website visit through its connecting/retry experience. Phone-width layout was checked in desktop Chrome. A sleeping API did wake successfully for a direct request, and the two-minute connection/retry behavior passed automated tests; the full website visit after a 15-minute sleep has not been verified.
+
+For independent grading, arrange browser enrollment before handing out access. The enrolled owner can approve an instructor's pending browser request; an entirely new, unapproved browser cannot sign in unattended. Open and sync the app before presenting, keep the local development setup available as a fallback, and create a new export if the stored sample data has changed.
+
+The private database handoff uses the session pooler `aws-0-ap-southeast-1.pooler.supabase.com`, port `5432`, database `postgres`, user `postgres.xoqpymjnsrgusrndhlqt`. The final Render deployment (`dep-db2bi5ui0phs73e37arg`) was confirmed Live; hosted acceptance checks passed again after that redeployment.
 
 Private provisioning files under `.demo/` contain the storage credentials and generated application secrets. They are excluded from Git and Docker; keep them private and preserve the backup encryption key. `.demo/database-password.txt` is the local handoff file for the database password chosen during project creation. Never copy these files into a public deployment record.
