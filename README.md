@@ -2,8 +2,51 @@
 
 Mobile-first, offline-first sari-sari store POS built with Next.js, TypeScript, Dexie, NestJS, Express, PostgreSQL, and MinIO.
 
-#Course:
-CCE106L Applications Development and Emerging Technologies
+Course project: CCE106L Applications Development and Emerging Technologies.
+
+## Preview
+
+![Mobile checkout](docs/ui-ux-audit/2026-10-02/05-checkout-cash.png)
+
+Recorded interface screenshot from the October 2026 UI audit.
+
+## Features
+
+- Checkout and sale records that operate from the local browser database.
+- Inventory tracking, including the smallest sellable unit.
+- Customer credit (utang), payment records, expenses, and reports.
+- Owner, admin, superadmin, and cashier workflows.
+- Encrypted browser-generated cloud backups when connectivity is available.
+
+This repository demonstrates an application prototype; it does not establish a commercial production deployment.
+
+## Architecture
+
+```text
+Next.js PWA → Dexie / IndexedDB (working data)
+           → NestJS / Express API → PostgreSQL
+           → encrypted backup upload → MinIO object storage
+```
+
+## Review the offline workflow
+
+1. Create a store and add products through the owner/admin workflow.
+2. Sign in as a cashier and record a cash sale.
+3. Disconnect networking in the browser and record another sale.
+4. Confirm local stock and sale records update while offline.
+5. Reconnect and inspect the backup workflow.
+
+Recorded views: [completed sale](docs/ui-ux-audit/2026-10-02/07-sale-completed.png), [offline cashier](docs/ui-ux-audit/2026-10-02/16-cashier-offline.png), and [queued offline sale](docs/ui-ux-audit/2026-10-02/17-offline-sale-queued.png). These screenshots show the recorded UI, not a new acceptance-test run.
+
+## Development checks
+
+```bash
+npm test
+npm run typecheck
+npm run build
+```
+
+The repository also includes real-stack and final-QA scripts. Inspect their environment requirements before running them.
 
 ## Local development
 
