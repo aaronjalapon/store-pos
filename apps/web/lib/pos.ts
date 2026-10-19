@@ -324,6 +324,7 @@ export async function saveProduct(input: {
   unit: string;
   lowStockThreshold: number;
   isQuickItem: boolean;
+  isActive?: boolean;
   soldByWeight?: boolean;
   quantityStep?: number;
   image?: ProductImageInput | null;
@@ -371,7 +372,7 @@ export async function saveProduct(input: {
     quantityStep,
     lowStockThreshold: input.lowStockThreshold,
     isQuickItem: input.isQuickItem,
-    isActive: existing?.isActive ?? true,
+    isActive: input.isActive ?? existing?.isActive ?? true,
     recordVersion: existing ? existing.recordVersion + 1 : 1,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
@@ -383,7 +384,15 @@ export async function saveProduct(input: {
       defaultSaleUnitId: input.defaultSaleUnitId ?? normalizedUnits.find((unit) => unit.canSell)?.id ?? null,
       defaultRestockUnitId: input.defaultRestockUnitId ?? normalizedUnits.find((unit) => unit.canRestock)?.id ?? null,
       displayUnitId: input.displayUnitId ?? normalizedUnits.find((unit) => unit.canSell)?.id ?? null,
-    } : {}),
+    } : {
+      baseUnit: existing?.baseUnit,
+      baseUnitId: existing?.baseUnitId,
+      stockBaseQuantity: existing?.stockBaseQuantity,
+      lowStockBaseThreshold: existing?.lowStockBaseThreshold,
+      defaultSaleUnitId: existing?.defaultSaleUnitId,
+      defaultRestockUnitId: existing?.defaultRestockUnitId,
+      displayUnitId: existing?.displayUnitId,
+    }),
   };
 
   const command: StoreCommand = {
@@ -463,6 +472,26 @@ export async function saveProduct(input: {
       }
     });
     return product;
+  });
+}
+
+export async function setProductAvailability(productId: string, isActive: boolean) {
+  const product = await db.products.get(productId);
+  if (!product) throw new Error('Product not found');
+  return saveProduct({
+    id: product.id,
+    name: product.name,
+    category: product.category,
+    barcode: product.barcode ?? undefined,
+    costPrice: product.costPrice,
+    sellingPrice: product.sellingPrice,
+    stockQuantity: product.stockQuantity,
+    unit: product.unit,
+    soldByWeight: product.soldByWeight,
+    quantityStep: product.quantityStep,
+    lowStockThreshold: product.lowStockThreshold,
+    isQuickItem: product.isQuickItem,
+    isActive,
   });
 }
 

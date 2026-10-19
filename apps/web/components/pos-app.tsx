@@ -12,7 +12,7 @@ import {
 import { db, removeLocalStoreData } from '../lib/db';
 import { centavosToPesoInput, pesoInputToCentavos } from '../lib/money';
 import {
-  adjustStock, completeSale, createCustomer, recordExpense, recordUtangPayment, saveProduct, type CartEntry,
+  adjustStock, completeSale, createCustomer, recordExpense, recordUtangPayment, saveProduct, setProductAvailability, type CartEntry,
   receiveStock, restockProduct, type ProductUnitInput,
 } from '../lib/pos';
 import { getCachedConflictMessage, getSyncState, isManagerAccessDenied, requestSync, retryNeedsAttention, type SyncState } from '../lib/api';
@@ -577,6 +577,7 @@ function LegacyInventoryView({ products, productUnits = [], inventoryMovements =
   const [lowStockOnly, setLowStockOnly] = useState(false);
   const [editing, setEditing] = useState<Product | null>(null);
   const [adjusting, setAdjusting] = useState<Product | null>(null);
+  const [pendingAvailability, setPendingAvailability] = useState<{ product: Product; isActive: boolean } | null>(null);
   const [scanner, setScanner] = useState(false);
   const [restocking, setRestocking] = useState<{ product: Product; initialUnitId: string | null } | null>(null);
   const [unknownBarcode, setUnknownBarcode] = useState<string | null>(null);
@@ -630,7 +631,53 @@ function LegacyInventoryView({ products, productUnits = [], inventoryMovements =
     }
     setRestocking({ product, initialUnitId: unit?.id ?? null });
   };
-  return <section className="page-panel inventory-page"><div className="page-header"><div><p className="eyebrow">STOCK CONTROL</p><h1>Inventory</h1><p>{products.length} products · <span className={lowStock ? 'warning-text' : ''}>{lowStock} low stock</span></p></div><div className="page-actions"><button className="secondary-button inventory-wide-scan" onClick={() => setScanner(true)}><Camera /> Quick Restock</button><button className="primary-button" onClick={() => openAddProduct()}><Plus /> Add product</button></div></div><div className="inventory-toolbar"><label className="search-box standalone"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name or barcode…" /></label><button type="button" className={`low-stock-filter ${lowStockOnly ? 'active' : ''}`} aria-pressed={lowStockOnly} onClick={() => setLowStockOnly((current) => !current)}><AlertTriangle /> Low stock <span>{lowStock}</span></button></div><div className="inventory-list">{filtered.map((product) => <article key={product.id} className="inventory-row"><ProductThumbnail product={product} /><div><strong>{product.name}</strong><small>{product.category} · {product.soldByWeight ? `Sold by weight · ${product.quantityStep} ${product.unit} step` : product.unit}{product.barcode ? ` · ${product.barcode}` : ''}</small></div><div className={product.stockQuantity <= product.lowStockThreshold ? 'stock-level low' : 'stock-level'}><strong>{formatQuantity(product.stockQuantity)}</strong><span>{product.unit} in stock</span></div><div className="inventory-price"><strong>{formatPeso(product.sellingPrice)}{product.soldByWeight ? `/${product.unit}` : ''}</strong><span>Cost {formatPeso(product.costPrice)}{product.soldByWeight ? `/${product.unit}` : ''}</span></div><div className="inventory-actions"><button className="primary-button compact" disabled={!product.isActive} onClick={() => setRestocking({ product, initialUnitId: null })} aria-label={`Restock ${product.name}`}><Plus /> Restock</button>{canAdjustStock && <button className="secondary-button compact" onClick={() => setAdjusting(product)}>Adjust</button>}</div><button className="secondary-button compact inventory-edit-button" onClick={() => openEditProduct(product)} aria-label={`Edit ${product.name}`}><PackageOpen /> Edit</button></article>)}</div><div className="phone-action-dock inventory-action-dock"><button type="button" className="dock-scan-button inventory-dock-scan" aria-label="Scan barcode to restock inventory" onClick={() => setScanner(true)}><Camera /><span>Scan to restock</span></button></div>{scanner && <CameraScanner onCode={handleRestockBarcode} onClose={() => setScanner(false)} suggestions={barcodeSuggestions} suggestionLabel="Inventory barcodes" />}{unknownBarcode && <ConfirmModal title="Barcode not found" description="No product is registered with this barcode. Would you like to add it now?" confirmLabel="Add product" onClose={() => setUnknownBarcode(null)} onConfirm={() => { const code = unknownBarcode; setUnknownBarcode(null); openAddProduct(code); }}><p className="barcode-confirmation"><span>BARCODE</span><strong>{unknownBarcode}</strong></p></ConfirmModal>}{inactiveBarcodeProduct && <ConfirmModal title="Product is inactive" description={`${inactiveBarcodeProduct.name} already uses barcode ${inactiveBarcodeProduct.barcode}. Edit or reactivate it before restocking.`} confirmLabel="Edit product" cancelLabel="Close" onClose={() => setInactiveBarcodeProduct(null)} onConfirm={() => { const product = inactiveBarcodeProduct; setInactiveBarcodeProduct(null); openEditProduct(product); }} />}{showForm && <ProductForm product={editing} productUnits={productUnits} initialBarcode={newProductBarcode ?? ''} barcodeSuggestions={editing ? productBarcodeSuggestions(products, { excludeProductId: editing.id }) : formBarcodeSuggestions} onClose={() => { setShowForm(false); setNewProductBarcode(null); }} />}{adjusting && canAdjustStock && <StockAdjustmentModal product={adjusting} onClose={() => setAdjusting(null)} onSave={(quantity, password) => adjustStock(adjusting, quantity, 'Manual stock adjustment', password)} />}{restocking && <QuickRestockModal product={restocking.product} units={productUnits} initialUnitId={restocking.initialUnitId} onClose={() => setRestocking(null)} onSave={(mode, quantity, unit) => mode === 'add' && unit ? receiveStock(restocking.product, unit, quantity) : restockProduct(restocking.product, mode, quantity)} />}</section>;
+  return <><section className="page-panel inventory-page">
+    <div className="page-header">
+      <div>
+        <p className="eyebrow">STOCK CONTROL</p>
+        <h1>Inventory</h1>
+        <p>{products.length} products · <span className={lowStock ? 'warning-text' : ''}>{lowStock} low stock</span></p>
+      </div>
+      <div className="page-actions">
+        <button className="secondary-button inventory-wide-scan" onClick={() => setScanner(true)}><Camera /> Quick Restock</button>
+        <button className="primary-button" onClick={() => openAddProduct()}><Plus /> Add product</button>
+      </div>
+    </div>
+    <div className="inventory-toolbar">
+      <label className="search-box standalone"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name or barcode…" /></label>
+      <button type="button" className={'low-stock-filter ' + (lowStockOnly ? 'active' : '')} aria-pressed={lowStockOnly} onClick={() => setLowStockOnly((current) => !current)}><AlertTriangle /> Low stock <span>{lowStock}</span></button>
+    </div>
+    <div className="inventory-list">{filtered.map((product) => <article key={product.id} className="inventory-row">
+      <ProductThumbnail product={product} />
+      <div>
+        <strong>{product.name}</strong>
+        <small>{product.category} · {product.soldByWeight ? 'Sold by weight · ' + product.quantityStep + ' ' + product.unit + ' step' : product.unit}{product.barcode ? ' · ' + product.barcode : ''}{!product.isActive && ' · Archived'}</small>
+      </div>
+      <div className={product.isActive && product.stockQuantity <= product.lowStockThreshold ? 'stock-level low' : 'stock-level'}>
+        <strong>{formatQuantity(product.stockQuantity)}</strong>
+        <span>{product.unit} in stock</span>
+      </div>
+      <div className="inventory-price">
+        <strong>{formatPeso(product.sellingPrice)}{product.soldByWeight ? '/' + product.unit : ''}</strong>
+        <span>Cost {formatPeso(product.costPrice)}{product.soldByWeight ? '/' + product.unit : ''}</span>
+      </div>
+      <div className="inventory-actions">
+        <button className="primary-button compact" disabled={!product.isActive} onClick={() => setRestocking({ product, initialUnitId: null })} aria-label={'Restock ' + product.name}><Plus /> Restock</button>
+        {canAdjustStock && product.isActive && <button className="secondary-button compact" onClick={() => setAdjusting(product)}>Adjust</button>}
+        {canAdjustStock && (product.isActive
+          ? <button type="button" className="danger-button compact" onClick={() => setPendingAvailability({ product, isActive: false })}><Archive size={16} /> Archive</button>
+          : <button type="button" className="secondary-button compact" onClick={() => setPendingAvailability({ product, isActive: true })}><Check size={16} /> Reactivate</button>)}
+      </div>
+      <button className="secondary-button compact inventory-edit-button" onClick={() => openEditProduct(product)} aria-label={'Edit ' + product.name}><PackageOpen /> Edit</button>
+    </article>)}</div>
+    <div className="phone-action-dock inventory-action-dock"><button type="button" className="dock-scan-button inventory-dock-scan" aria-label="Scan barcode to restock inventory" onClick={() => setScanner(true)}><Camera /><span>Scan to restock</span></button></div>
+    {scanner && <CameraScanner onCode={handleRestockBarcode} onClose={() => setScanner(false)} suggestions={barcodeSuggestions} suggestionLabel="Inventory barcodes" />}
+    {unknownBarcode && <ConfirmModal title="Barcode not found" description="No product is registered with this barcode. Would you like to add it now?" confirmLabel="Add product" onClose={() => setUnknownBarcode(null)} onConfirm={() => { const code = unknownBarcode; setUnknownBarcode(null); openAddProduct(code); }}><p className="barcode-confirmation"><span>BARCODE</span><strong>{unknownBarcode}</strong></p></ConfirmModal>}
+    {inactiveBarcodeProduct && <ConfirmModal title="Product is inactive" description={inactiveBarcodeProduct.name + ' already uses barcode ' + inactiveBarcodeProduct.barcode + '. Edit or reactivate it before restocking.'} confirmLabel="Edit product" cancelLabel="Close" onClose={() => setInactiveBarcodeProduct(null)} onConfirm={() => { const product = inactiveBarcodeProduct; setInactiveBarcodeProduct(null); openEditProduct(product); }} />}
+    {showForm && <ProductForm product={editing} productUnits={productUnits} initialBarcode={newProductBarcode ?? ''} barcodeSuggestions={editing ? productBarcodeSuggestions(products, { excludeProductId: editing.id }) : formBarcodeSuggestions} onClose={() => { setShowForm(false); setNewProductBarcode(null); }} />}
+    {adjusting && canAdjustStock && <StockAdjustmentModal product={adjusting} onClose={() => setAdjusting(null)} onSave={(quantity, password) => adjustStock(adjusting, quantity, 'Manual stock adjustment', password)} />}
+    {restocking && <QuickRestockModal product={restocking.product} units={productUnits} initialUnitId={restocking.initialUnitId} onClose={() => setRestocking(null)} onSave={(mode, quantity, unit) => mode === 'add' && unit ? receiveStock(restocking.product, unit, quantity) : restockProduct(restocking.product, mode, quantity)} />}
+  </section>{pendingAvailability && <ConfirmModal title={pendingAvailability.isActive ? 'Reactivate ' + pendingAvailability.product.name + '?' : 'Archive ' + pendingAvailability.product.name + '?'} description={pendingAvailability.isActive ? pendingAvailability.product.name + ' will be available for sale and restocking again.' : pendingAvailability.product.name + ' will no longer be available for sale or restocking. Its inventory history and barcode are kept.'} confirmLabel={pendingAvailability.isActive ? 'Reactivate product' : 'Archive product'} tone={pendingAvailability.isActive ? 'primary' : 'danger'} onClose={() => setPendingAvailability(null)} onConfirm={async () => { await setProductAvailability(pendingAvailability.product.id, pendingAvailability.isActive); setPendingAvailability(null); }} />}</>;
 }
 
 export function InventoryView(props: { products: Product[]; productUnits?: ProductUnit[]; inventoryMovements?: InventoryMovement[]; canAdjustStock?: boolean }) {

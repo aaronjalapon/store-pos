@@ -101,13 +101,27 @@ describe('Utang search and app modal improvements', () => {
     await waitFor(() => expect(save).toHaveBeenCalledWith(2000));
   });
 
-  it('validates and saves stock quantity in an app modal', async () => {
+  it('reviews a stock adjustment before saving and preserves the form when returning', async () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<StockAdjustmentModal product={product({ stockQuantity: 3 })} onClose={vi.fn()} onSave={save} />);
     fireEvent.change(screen.getByLabelText('New stock quantity'), { target: { value: '8' } });
     expect(screen.getByText('+5 piece')).toBeTruthy();
     fireEvent.change(screen.getByLabelText('Confirm your password'), { target: { value: 'owner-password' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Verify & save quantity' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review adjustment' }));
+
+    const confirmation = screen.getByRole('dialog', { name: 'Confirm stock update' });
+    expect(within(confirmation).getByText('Current stock')).toBeTruthy();
+    expect(within(confirmation).getByText('New stock')).toBeTruthy();
+    expect(within(confirmation).getByText('+5 piece')).toBeTruthy();
+    expect(save).not.toHaveBeenCalled();
+
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Back' }));
+    expect((screen.getByLabelText('New stock quantity') as HTMLInputElement).value).toBe('8');
+    expect((screen.getByLabelText('Confirm your password') as HTMLInputElement).value).toBe('owner-password');
+    expect(save).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review adjustment' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }));
     await waitFor(() => expect(save).toHaveBeenCalledWith(8, 'owner-password'));
   });
 
@@ -150,9 +164,10 @@ describe('Utang search and app modal improvements', () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<StockAdjustmentModal product={product({ unit: 'kg', soldByWeight: true, quantityStep: 0.01, stockQuantity: 5 })} onClose={vi.fn()} onSave={save} />);
     fireEvent.change(screen.getByLabelText('New stock quantity'), { target: { value: '4.25' } });
-    expect((screen.getByRole('button', { name: 'Verify & save quantity' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Review adjustment' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(screen.getByLabelText('Confirm your password'), { target: { value: 'owner-password' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Verify & save quantity' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review adjustment' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }));
     await waitFor(() => expect(save).toHaveBeenCalledWith(4.25, 'owner-password'));
   });
 
@@ -182,10 +197,40 @@ describe('Utang search and app modal improvements', () => {
     render(<InventoryView products={[active, inactive]} />);
 
     expect((screen.getByRole('button', { name: 'Restock Archived drink' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/Archived$/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reactivate' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Restock Active drink' }));
 
     expect(screen.getByRole('dialog', { name: 'Restock Active drink' })).toBeTruthy();
     expect(screen.queryByRole('combobox', { name: 'Barcode' })).toBeNull();
+  });
+
+  it('archives and reactivates an inventory product through confirmed availability changes', async () => {
+    const item = product({ name: 'Seasonal drink' });
+    await db.products.add(item);
+    const view = render(<InventoryView products={[item]} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    const archiveConfirmation = screen.getByRole('dialog', { name: 'Archive Seasonal drink?' });
+    expect(within(archiveConfirmation).getByText(/no longer be available for sale or restocking/)).toBeTruthy();
+    fireEvent.click(within(archiveConfirmation).getByRole('button', { name: 'Cancel' }));
+    expect((await db.products.get(item.id))?.isActive).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Archive product' }));
+    await waitFor(async () => expect((await db.products.get(item.id))?.isActive).toBe(false));
+    expect((await db.mutationQueue.toArray()).some((entry) => entry.request.command.type === 'saveProduct'
+      && entry.request.command.payload.id === item.id
+      && entry.request.command.payload.isActive === false)).toBe(true);
+
+    view.rerender(<InventoryView products={[{ ...item, isActive: false }]} />);
+    expect(screen.getByText(/Archived$/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Reactivate' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Reactivate product' }));
+    await waitFor(async () => expect((await db.products.get(item.id))?.isActive).toBe(true));
+    expect((await db.mutationQueue.toArray()).some((entry) => entry.request.command.type === 'saveProduct'
+      && entry.request.command.payload.id === item.id
+      && entry.request.command.payload.isActive === true)).toBe(true);
   });
 
   it('defaults to a configured bulk unit and adds its converted base stock', async () => {
@@ -247,7 +292,10 @@ describe('Utang search and app modal improvements', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Set total' }));
     fireEvent.change(screen.getByLabelText('Final stock (piece)'), { target: { value: '12' } });
     expect(screen.getByText('+7 piece')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Save restock' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review stock total' }));
+    expect(screen.getByRole('dialog', { name: 'Confirm stock update' })).toBeTruthy();
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }));
     await waitFor(() => expect(save).toHaveBeenCalledWith('set', 12, null));
   });
 
